@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# model weights — download separately, see README
+checkpoints/
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# runtime output
+odometry_log/
+scene_log/
+*.log
+*.csv
