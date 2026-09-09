@@ -496,14 +496,17 @@ class MultilegViewer:
                                              # object's own weak scores still clear the bar.
                                              "--dino-clip-min-sim", "0.4",
                                              "--dino-appearance-min-sim", "0.4",
-                                             # Live-confirmed 2026-09-09: imu_heading_deg stayed
-                                             # bit-identical across 6s of real, encoder-confirmed
-                                             # rotation -- the BNO08x heading channel is dead/frozen,
-                                             # not just uncalibrated. Force pure wheel-differential
-                                             # dead reckoning so turns don't wait-then-abort on a
-                                             # sensor that will never calibrate. Remove once the IMU
-                                             # is physically fixed.
-                                             "--encoder-only",
+                                             # Was --encoder-only (hard-forced) from 2026-09-09's
+                                             # earlier frozen-IMU diagnosis. Per user request
+                                             # (2026-09-09, later same day): use the IMU again --
+                                             # run_rover_multileg.py now self-detects a frozen/dead
+                                             # heading channel LIVE and falls back to encoder-only
+                                             # automatically the first time it actually catches the
+                                             # fault (--auto-encoder-only, on by default, see
+                                             # nav_pipeline/odometry_logger.py's _check_imu_alive) --
+                                             # no manual flag needed either way now. Pass
+                                             # --encoder-only explicitly again only if the detector
+                                             # itself turns out to be the problem.
                                              # Live-observed 2026-09-09: --max-angular defaults to
                                              # 1.2 rad/s (run_rover_multileg.py's own object-leg CLI
                                              # default), but bearing_to_angular's ramp constants
