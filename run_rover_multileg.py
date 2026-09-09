@@ -772,6 +772,7 @@ class PlanRunner:
             except Exception as e:
                 print(f"  [{label}] [memory] A* routing failed ({e}) -- falling back to a straight line")
         t_start = time.time()
+        turn_sign: Optional[float] = None   # latched while |bearing| > 70deg -- see below
         while not self._abort and time.time() - t_start < a.goal_memory_approach_timeout_s:
             x, y, th = node.odom.x, node.odom.y, node.odom.theta
             if math.hypot(gx - x, gy - y) < a.goal_memory_arrive_m:
@@ -808,13 +809,35 @@ class PlanRunner:
             # off to NavDP's obstacle-aware GOTO once it's within a forward
             # cone NavDP can actually plan through.
             if abs(bearing) > math.radians(70.0):
-                w = clamp(1.2 * bearing, -a.turn_max_angular, a.turn_max_angular)
+                # 1.2*bearing is ALREADY saturated at +/-turn_max_angular
+                # for this entire branch (1.2*radians(70) = 1.47rad, far
+                # past turn_max_angular=0.6) -- so the only thing that ever
+                # varies here is the SIGN of bearing, and atan2 is
+                # numerically unstable exactly at +/-180deg: with the target
+                # nearly directly behind, ordinary odometry noise flips
+                # `lat`'s sign tick to tick, flipping bearing between just
+                # under and just over +/-180deg -- and the commanded turn
+                # direction flips WITH it, every tick, for as long as the
+                # target sits back there. Live-observed 2026-09-09: reads as
+                # the rover twitching/reversing direction mid-turn instead
+                # of committing to one way around -- no DINO or Qwen
+                # involved at all (this whole branch is pure odometry, see
+                # the external_goal branch of pipeline.py's step() which
+                # skips the detector entirely). Fix: decide the turn
+                # direction ONCE on entry to this state and hold it until
+                # the state is exited (bearing back under 70deg) -- a fresh
+                # waypoint/re-entry gets to decide again, which is fine,
+                # that's a genuinely new decision point.
+                if turn_sign is None:
+                    turn_sign = math.copysign(1.0, bearing)
+                w = turn_sign * a.turn_max_angular
                 node.publish_cmd(0.0, self._slew(w))
                 self._integrate_occupancy()
                 self._publish_status("object", f"{phrase} (memory approach: turning to face, "
                                                f"{math.degrees(bearing):+.0f}deg)")
                 time.sleep(period)
                 continue
+            turn_sign = None   # exited the behind-us state -- next entry decides fresh
             try:
                 gres = node.pipe.step(rgb, "", depth=depth, pose=(x, y, th), intrinsics=intr,
                                       external_goal=np.array([fwd, lat, 0.0], dtype=np.float32))
