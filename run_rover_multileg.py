@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 # nav_pipeline pulls in torch/transformers/navdp -- imported lazily in main()
 # so --dry-run stays instant and doesn't need the heavy env.
 GuardConfig = DinoNavDPPipeline = PipelineConfig = DinoNavDPZenohNode = serialize_string = None
-LiveOccupancy = parse_string = None
+LiveOccupancy = parse_string = thin_waypoints = None
 # fact3r-map's "entity memory" (SigLIP2 appearance embeddings) integrated
 # into the live rover's goal_memory: an OPT-IN twin of dinov2_embedder.py's
 # Dinov2Embedder (see nav_pipeline/siglip2_embedder.py), not the SAM2+SigLIP2
@@ -86,15 +86,16 @@ _OCC_UNKNOWN, _OCC_FREE, _OCC_OCCUPIED = -1, 0, 1
 
 def _load_nav_pipeline():
     global GuardConfig, DinoNavDPPipeline, PipelineConfig, DinoNavDPZenohNode, serialize_string
-    global LiveOccupancy, parse_string
+    global LiveOccupancy, parse_string, thin_waypoints
     from nav_pipeline.obstacle_guard import GuardConfig as _GC
     from nav_pipeline.pipeline import DinoNavDPPipeline as _P, PipelineConfig as _PC
     from nav_pipeline.zenoh_node import (
         DinoNavDPZenohNode as _N, parse_string as _ps, serialize_string as _ss,
     )
-    from nav_pipeline.live_occupancy import LiveOccupancy as _LO
+    from nav_pipeline.live_occupancy import LiveOccupancy as _LO, thin_waypoints as _tw
     GuardConfig, DinoNavDPPipeline, PipelineConfig, DinoNavDPZenohNode, serialize_string = _GC, _P, _PC, _N, _ss
     LiveOccupancy, parse_string = _LO, _ps
+    thin_waypoints = _tw
 
     global Siglip2Embedder
     from nav_pipeline.siglip2_embedder import Siglip2Embedder as _SE
@@ -733,6 +734,43 @@ class PlanRunner:
                                      "world_xy": [gx, gy], "ts": hit_ts})
         node = self.node
         period = 1.0 / a.metric_hz
+        # A* over the live-carved BEV occupancy grid (nav_pipeline/
+        # live_occupancy.py), same building block the offline sim_bridge
+        # return-path uses (A* centerline -> waypoint-by-waypoint NavDP) --
+        # previously built but never called from this live path (all memory
+        # approaches drove a raw straight line at the remembered point,
+        # leaving NavDP's own reactive obstacle guard as the only thing
+        # standing between the rover and anything it had already mapped in
+        # the way). A "go back to X" leg is exactly the case this helps
+        # most: the grid cells between here and there were very likely
+        # observed on the ORIGINAL trip that reached X in the first place.
+        # Route-finding only changes what point each tick steers TOWARD --
+        # the final-arrival check below still measures against the true
+        # remembered (gx, gy), and if no route is found this degrades
+        # exactly to the prior straight-line behavior, not a hard failure.
+        route: Optional[List[Tuple[float, float]]] = None
+        route_idx = 0
+        if self.occupancy is not None and thin_waypoints is not None:
+            try:
+                x0, y0 = node.odom.x, node.odom.y
+                path, info = self.occupancy.astar((x0, y0), (gx, gy))
+                if path is None:
+                    # Strict pass refuses UNKNOWN cells -- exactly the common
+                    # case here (only the outbound trip's OWN path is
+                    # confirmed-free, not the whole room), so retry once
+                    # allowing them, per live_occupancy.py's own documented
+                    # "route of last resort" calling convention.
+                    path, info = self.occupancy.astar((x0, y0), (gx, gy), allow_unknown=True)
+                if path and len(path) >= 2:
+                    route = thin_waypoints(path, spacing=a.goal_memory_waypoint_spacing_m)
+                    print(f"  [{label}] [memory] A* route: {len(route)} waypoints, "
+                          f"{info.get('length_m', 0):.1f}m over {info.get('cells', 0)} cells")
+                else:
+                    reason = info.get("reason", "no path") if isinstance(info, dict) else "no path"
+                    print(f"  [{label}] [memory] A* found no route ({reason}) -- "
+                          f"falling back to a straight line at the remembered point")
+            except Exception as e:
+                print(f"  [{label}] [memory] A* routing failed ({e}) -- falling back to a straight line")
         t_start = time.time()
         while not self._abort and time.time() - t_start < a.goal_memory_approach_timeout_s:
             x, y, th = node.odom.x, node.odom.y, node.odom.theta
@@ -740,12 +778,22 @@ class PlanRunner:
                 print(f"  [{label}] [memory] within {a.goal_memory_arrive_m:.1f}m of the "
                       f"remembered point -- handing off to DINO")
                 break
+            # Steer toward the current route waypoint if A* gave one,
+            # advancing once close enough -- the LAST waypoint should equal
+            # (gx, gy) itself (thin_waypoints always keeps the final point),
+            # so this converges on the same target the no-route path uses.
+            tx, ty = gx, gy
+            if route:
+                while route_idx < len(route) - 1 and math.hypot(route[route_idx][0] - x,
+                                                                 route[route_idx][1] - y) < a.goal_memory_waypoint_advance_m:
+                    route_idx += 1
+                tx, ty = route[route_idx]
             with node.lock:
                 rgb, depth, intr = node.latest_rgb, node.latest_depth, node.latest_intrinsics
             if rgb is None:
                 time.sleep(period)
                 continue
-            fwd, lat = body_delta(gx - x, gy - y, th)
+            fwd, lat = body_delta(tx - x, ty - y, th)
             bearing = math.atan2(lat, fwd)
             # NavDP's diffusion trajectories are forward-biased (trained on
             # ego-forward motion) -- fed a remembered point that's actually
@@ -1609,6 +1657,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--goal-memory-arrive-m", type=float, default=1.5,
                    help="stop the memory-guided approach once within this distance and hand off "
                         "to DINO -- never trust memory alone for the final approach")
+    p.add_argument("--goal-memory-waypoint-spacing-m", type=float, default=0.6,
+                   help="A* route thinning: keep waypoints roughly this far apart (thin_waypoints' "
+                        "own default) -- raw cell-by-cell A* output is 0.1m apart, far too dense to "
+                        "steer to")
+    p.add_argument("--goal-memory-waypoint-advance-m", type=float, default=0.5,
+                   help="advance to the next A* waypoint once within this distance of the current "
+                        "one (the LAST waypoint is always the true remembered point itself, still "
+                        "gated by --goal-memory-arrive-m separately)")
     # fact3r-map ENTITY memory integration -- see nav_pipeline/siglip2_embedder.py's
     # module docstring for why SigLIP2 specifically (same encoder family
     # fact3r-map's own entity/goal memory already standardizes on). Opt-in
