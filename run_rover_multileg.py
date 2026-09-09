@@ -75,7 +75,7 @@ Siglip2Embedder = None
 # equivalent of; a live record here is just {query_text, world_xy, ts}.
 # Optional: a missing/moved MASt3R-SLAM checkout just disables recall,
 # never breaks the rest of the runner.
-_goal_memory_load = _goal_memory_append = _goal_memory_normalize = None
+_goal_memory_load = _goal_memory_append = _goal_memory_normalize = _goal_memory_find_hit = None
 
 # LiveOccupancy grid values (see nav_pipeline/live_occupancy.py) -- copied
 # here as plain ints so the occupancy-image encoder below works even before
@@ -100,13 +100,23 @@ def _load_nav_pipeline():
     from nav_pipeline.siglip2_embedder import Siglip2Embedder as _SE
     Siglip2Embedder = _SE
 
-    global _goal_memory_load, _goal_memory_append, _goal_memory_normalize
+    global _goal_memory_load, _goal_memory_append, _goal_memory_normalize, _goal_memory_find_hit
     fact3r_map_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "MASt3R-SLAM", "fact3r-map")
     if fact3r_map_root not in sys.path:
         sys.path.insert(0, fact3r_map_root)
     try:
-        from fact3r.semantics.goal_memory import append_memory as _gma, load_memory as _gml, normalize_query as _gmn
+        from fact3r.semantics.goal_memory import (
+            append_memory as _gma, load_memory as _gml, normalize_query as _gmn, find_memory_hit as _gmf,
+        )
         _goal_memory_load, _goal_memory_append, _goal_memory_normalize = _gml, _gma, _gmn
+        # find_memory_hit's tier-1 fallback (SigLIP2 text-paraphrase
+        # similarity, see resolve_semantic_goal_verified.py's locate-stage
+        # step 2) needs a TextEncoder -- only usable once --goal-memory-
+        # appearance loads a Siglip2Embedder (it satisfies that Protocol
+        # directly, see siglip2_embedder.py). Without it, _recall_and_
+        # approach() falls back to tier-0 exact match only (unchanged
+        # pre-existing behavior).
+        _goal_memory_find_hit = _gmf
     except Exception as e:
         print(f"[memory] fact3r-map goal_memory not available ({e}) -- recall disabled, "
               f"expected MASt3R-SLAM as a sibling of {os.path.dirname(os.path.abspath(__file__))}")
@@ -316,6 +326,25 @@ Reply with ONLY a JSON object:
 {{"target": "...", "status": "...", "action": "...", "reason": "..."}}"""
 
 
+RECALL_VERIFY_PROMPT = """You are verifying whether a robot has re-found the SAME physical object \
+it found before, not just something else with a similar name.
+
+Remembered object: "{phrase}"
+{age_note}
+
+Images: [1] the robot's current camera view. [2] a close crop of the object the \
+detector is currently locked onto, which the robot is proposing as a re-find of \
+the remembered object.
+
+Judge from crop [2] (using [1] for surrounding context if it helps) whether this \
+plausibly IS the same physical instance -- consider colour, shape, material, and \
+visible surroundings, not just the category name. A different chair is NOT a match \
+for "the chair" even though the category matches.
+
+Reply with ONLY a JSON object:
+{{"decision": "yes"|"no"|"uncertain", "confidence": 0.0-1.0, "reason": "one short sentence"}}"""
+
+
 class TaskSupervisor:
     """Throttled Qwen-VL call that watches a DINO-grounded object subtask and
     returns {target, status, reason}. Does NOT produce coordinates -- grounding
@@ -394,6 +423,54 @@ class TaskSupervisor:
             print(f"[supervisor] call failed: {e}")
             return None
 
+    def verify_recall(self, rgb, crop, phrase: str, age_s: float) -> Optional[dict]:
+        """Locate-stage step 3 (resolve_semantic_goal_verified.py's
+        Qwen3VLVerifier.verify_many), adapted to a live single-candidate
+        tick instead of an offline multi-view evidence render: is the
+        object DINO is currently locked onto plausibly the SAME physical
+        instance goal_memory recalled for `phrase`, not just the same
+        category? Reuses THIS SAME already-loaded model/processor -- the
+        one already doing navigation supervision via check() -- rather than
+        a second Qwen3VLVerifier instance, so this costs zero extra VRAM
+        and zero extra model load time. Returns the same strict-JSON
+        decision/confidence/reason shape the offline verifier uses (minus
+        predicted_object/confusable_with/supporting_frames, which only mean
+        something across multiple rendered evidence views)."""
+        if crop is None or getattr(crop, "size", 0) == 0 or min(crop.shape[:2]) < 8:
+            return None
+        try:
+            self._ensure_loaded()
+            import torch
+            from PIL import Image
+            images = [Image.fromarray(rgb.astype("uint8")), Image.fromarray(crop.astype("uint8"))]
+            age_note = (f"It was last confirmed seen {age_s:.0f}s ago at a different position -- "
+                        f"the robot has since driven back hoping to find it again.")
+            prompt = RECALL_VERIFY_PROMPT.format(phrase=phrase, age_note=age_note)
+            content = [{"type": "image", "image": im} for im in images]
+            content.append({"type": "text", "text": prompt})
+            messages = [{"role": "user", "content": content}]
+            text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = self._processor(text=[text], images=images, return_tensors="pt").to(self._model.device)
+            with torch.no_grad():
+                out = self._model.generate(**inputs, max_new_tokens=120, do_sample=False)
+            reply = self._processor.batch_decode(
+                out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+            v = _extract_json(reply)
+            if not v or "decision" not in v:
+                return {"decision": "uncertain", "confidence": 0.0, "reason": f"unparsed: {reply[:80]}"}
+            v["decision"] = str(v["decision"]).strip().lower()
+            if v["decision"] not in ("yes", "no", "uncertain"):
+                v["decision"] = "uncertain"
+            try:
+                v["confidence"] = float(v.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                v["confidence"] = 0.0
+            v.setdefault("reason", "")
+            return v
+        except Exception as e:
+            print(f"[supervisor] recall verification failed: {e}")
+            return None
+
 
 # ======================================================================
 #  Runner
@@ -433,6 +510,7 @@ class PlanRunner:
         self.appearance_embedder = None
         self._recalled_appearance_embedding: Optional[np.ndarray] = None  # set by _recall_and_approach,
         # consumed once by the next object_leg's DINO loop, then cleared
+        self._recalled_hit_age_s: Optional[float] = None   # goes with the embedding above
 
     def _publish_status(self, kind: str, desc: str, detector: Optional[dict] = None,
                          supervisor: Optional[dict] = None, force: bool = False,
@@ -599,18 +677,35 @@ class PlanRunner:
         closed the distance)."""
         a = self.args
         self._recalled_appearance_embedding = None   # reset -- stale from a previous leg otherwise
+        self._recalled_hit_age_s = None
         if not a.goal_memory or _goal_memory_load is None or _goal_memory_normalize is None:
             return False
         try:
             records = _goal_memory_load(Path(a.goal_memory_path))
         except Exception:
             return False
-        target_norm = _goal_memory_normalize(phrase)
+        records = [r for r in records if "world_xy" in r]
+        # Locate-stage step 2 (resolve_semantic_goal_verified.py): memory
+        # check happens with tier-0 exact match first, tier-1 SigLIP2
+        # paraphrase-similarity fallback second. Tier 1 needs a TextEncoder
+        # (SigLIP2's text tower) -- reuse the SAME appearance embedder
+        # --goal-memory-appearance already loads for the image side, rather
+        # than a second model. Without that flag, this degrades to tier-0
+        # only, exactly the pre-existing behavior.
+        embedder = self._ensure_appearance_embedder()
         hit = None
-        for r in reversed(records):
-            if _goal_memory_normalize(str(r.get("query_text", ""))) == target_norm and "world_xy" in r:
-                hit = r
-                break
+        if embedder is not None and _goal_memory_find_hit is not None:
+            try:
+                hit = _goal_memory_find_hit(phrase, records, embedder,
+                                            min_similarity=a.goal_memory_paraphrase_min_sim)
+            except Exception as e:
+                print(f"  [{label}] [memory] paraphrase lookup failed ({e}) -- falling back to exact match")
+        if hit is None:
+            target_norm = _goal_memory_normalize(phrase)
+            for r in reversed(records):
+                if _goal_memory_normalize(str(r.get("query_text", ""))) == target_norm:
+                    hit = r
+                    break
         if hit is None:
             return False
         gx, gy = hit["world_xy"]
@@ -628,8 +723,9 @@ class PlanRunner:
         # (there's nothing to visually compare against yet while driving
         # blind toward a remembered point with no live detection).
         stored_emb = hit.get("appearance_embedding")
-        if stored_emb and self._ensure_appearance_embedder() is not None:
+        if stored_emb and embedder is not None:
             self._recalled_appearance_embedding = np.asarray(stored_emb, dtype=np.float32)
+            self._recalled_hit_age_s = age_s
             print(f"  [{label}] [memory] recalled view also carries an appearance signature -- "
                   f"will sanity-check the first live re-detection against it")
         self._publish_status("object", phrase, force=True,
@@ -1001,6 +1097,41 @@ class PlanRunner:
                                       f"sim={appearance_sim:.2f} (floor {a.goal_memory_appearance_min_sim:.2f}){flag}")
                         except Exception as e:
                             print(f"  [{label}] [memory] appearance check failed (ignoring): {e}")
+                        # Locate-stage step 3, live-adapted (see TaskSupervisor.
+                        # verify_recall's docstring): SigLIP similarity alone is
+                        # a coarse gate (same category, different instance can
+                        # still score reasonably high) -- the SAME Qwen model
+                        # already supervising this leg's navigation also judges
+                        # the crop against the remembered phrase. A confident
+                        # "no" forces DINO to drop this lock and re-search
+                        # instead of quietly approaching the wrong object,
+                        # mirroring the offline pipeline's accept-threshold
+                        # philosophy (decision==yes, confidence>=floor) rather
+                        # than only logging a warning.
+                        if self.supervisor is not None:
+                            try:
+                                b = np.asarray(det.box, dtype=int)
+                                pad = 12
+                                y0, y1 = max(b[1] - pad, 0), min(b[3] + pad, rgb_now.shape[0])
+                                x0, x1 = max(b[0] - pad, 0), min(b[2] + pad, rgb_now.shape[1])
+                                vcrop = rgb_now[y0:y1, x0:x1].copy() if y1 > y0 and x1 > x0 else None
+                            except Exception:
+                                vcrop = None
+                            verdict = self.supervisor.verify_recall(
+                                rgb_now, vcrop, phrase, self._recalled_hit_age_s or 0.0)
+                            if verdict is not None:
+                                print(f"  [{label}] [memory] Qwen recall verification: "
+                                      f"{verdict['decision']} (confidence {verdict['confidence']:.2f}) "
+                                      f"-- {verdict.get('reason', '')[:80]}")
+                                if (verdict["decision"] == "no"
+                                        and verdict["confidence"] >= a.goal_memory_min_vlm_confidence):
+                                    print(f"  [{label}] [memory] Qwen rejects the recalled match -- "
+                                          f"dropping this DINO lock and searching fresh")
+                                    node.pipe.reset()
+                                    node._stop_streak = 0
+                                    last_det_t = 0.0   # so close-loss/approach-lost logic doesn't
+                                    last_goal_dist = None   # trust the just-rejected lock's history
+                                    min_goal_dist = None
 
             # -- ARRIVAL-ON-CLOSE-LOSS: DINO lost the lock while it was close
             #    (box fills the frame when you're on top of the object). Do NOT
@@ -1494,6 +1625,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--goal-memory-appearance-min-sim", type=float, default=0.5,
                    help="cosine similarity floor below which a re-detection is flagged as possibly "
                         "a different object than the one remembered (advisory, not a hard veto)")
+    p.add_argument("--goal-memory-paraphrase-min-sim", type=float, default=0.90,
+                   help="tier-1 memory lookup: SigLIP2 text-embedding cosine-similarity floor for "
+                        "matching a NEW phrasing (e.g. 'the fridge') against a past query_text "
+                        "(e.g. 'white air cooler') when no exact normalized match exists -- same "
+                        "default as resolve_semantic_goal_verified.py's --memory-min-similarity")
+    p.add_argument("--goal-memory-min-vlm-confidence", type=float, default=0.6,
+                   help="Qwen recall-verification: a 'no' at/above this confidence drops the "
+                        "current DINO lock and forces a fresh search instead of trusting the "
+                        "memory-recalled match. Lower than the offline pipeline's 0.75 default "
+                        "(--min-vlm-confidence) since a live single-view crop is weaker evidence "
+                        "than that pipeline's multi-view render.")
 
     # self-check
     p.add_argument("--odom-selfcheck", action="store_true", default=True,
@@ -1541,6 +1683,10 @@ def _config_summary(args) -> dict:
         goal_memory_approach=args.goal_memory_approach,
         goal_memory_appearance=(args.goal_memory_appearance and args.goal_memory_approach),
         siglip_model_id=args.siglip_model_id if args.goal_memory_appearance else None,
+        goal_memory_paraphrase_min_sim=(args.goal_memory_paraphrase_min_sim
+                                        if args.goal_memory_appearance else None),
+        goal_memory_min_vlm_confidence=(args.goal_memory_min_vlm_confidence
+                                        if args.goal_memory_appearance else None),
     )
 
 

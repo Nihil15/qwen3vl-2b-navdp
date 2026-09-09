@@ -51,6 +51,26 @@ class Siglip2Embedder:
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats[0].float().cpu().numpy()
 
+    @torch.no_grad()
+    def encode_text(self, texts) -> np.ndarray:
+        """L2-normalized SigLIP2 text-tower embeddings, one row per text.
+
+        Signature/semantics match MASt3R-SLAM/fact3r-map/fact3r/semantics/
+        goal_memory.py's TextEncoder Protocol exactly (structural typing --
+        this class needs no inheritance from it to satisfy it), so a
+        Siglip2Embedder instance can be passed straight into that module's
+        find_memory_hit() for its tier-1 paraphrase-similarity fallback
+        ("go back to the mug" vs "the coffee mug"), the same mechanism
+        resolve_semantic_goal_verified.py's offline locate stage uses.
+        SigLIP was trained with texts padded to the model's fixed max
+        length (unlike CLIP's variable-length padding), so this pads to
+        max_length rather than the shortest-batch-member default.
+        """
+        inputs = self.processor(text=list(texts), padding="max_length", return_tensors="pt").to(self.device)
+        feats = self.model.get_text_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        return feats.float().cpu().numpy()
+
     @staticmethod
     def cosine(a: np.ndarray, b: np.ndarray) -> float:
         """Both embeddings are already L2-normalized by embed(), so a plain
