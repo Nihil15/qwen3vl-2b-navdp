@@ -319,7 +319,7 @@ SUPERVISOR_PROMPT = """You are the SUPERVISOR + NAVIGATOR of a ground robot doin
 SUBTASK: "{clause}"
 The robot's object detector is currently locked on the phrase: "{target}"
 Detector state this moment: {dino_state}
-Images: [1] the robot's current forward camera view. {crop_note}
+Images: [1] the robot's current forward camera view. {crop_note}{history_note}
 
 Decide, from the camera view:
 
@@ -410,19 +410,37 @@ class TaskSupervisor:
         self._model = _VLM.from_pretrained(self.model_id, **kwargs).eval()
         self._processor = AutoProcessor.from_pretrained(self.model_id)
 
-    def check(self, rgb, clause: str, target: str, dino_state: str, crop=None) -> Optional[dict]:
+    def check(self, rgb, clause: str, target: str, dino_state: str, crop=None,
+              history_frames: Optional[list] = None) -> Optional[dict]:
+        """history_frames: NavDP's own short-term visual memory (see
+        DinoNavDPPipeline.get_recent_frames), oldest first -- the same
+        couple of recent frames NavDP's diffusion policy itself has been
+        conditioning on, given to Qwen too so "is progress being made"
+        judgments aren't made from a single frozen frame every call. Purely
+        additive: omit (default) for the exact previous single/dual-image
+        behavior."""
         try:
             self._ensure_loaded()
             import torch
             from PIL import Image
-            img = Image.fromarray(rgb.astype("uint8"))
-            images = [img]
+            images = [Image.fromarray(rgb.astype("uint8"))]
             crop_note = ""
             if crop is not None and getattr(crop, "size", 0) and min(crop.shape[:2]) >= 8:
                 images.append(Image.fromarray(crop.astype("uint8")))
-                crop_note = "[2] a close crop of what the detector is currently locked on -- judge if it is the right object."
+                crop_note = f"[{len(images)}] a close crop of what the detector is currently locked on -- judge if it is the right object."
+            history_note = ""
+            if history_frames:
+                start = len(images) + 1
+                for f in history_frames:
+                    images.append(Image.fromarray(f.astype("uint8")))
+                end = len(images)
+                span = f"[{start}]" if start == end else f"[{start}-{end}]"
+                history_note = (f" {span} NavDP's own recent frame(s), OLDEST first, lower "
+                                f"resolution than [1] -- use these ONLY to judge motion/progress "
+                                f"since a moment ago (getting closer? passed it? still searching the "
+                                f"same view?), not for fine detail.")
             prompt = SUPERVISOR_PROMPT.format(clause=clause, target=target, dino_state=dino_state,
-                                              crop_note=crop_note)
+                                              crop_note=crop_note, history_note=history_note)
             content = [{"type": "image", "image": im} for im in images]
             content.append({"type": "text", "text": prompt})
             messages = [{"role": "user", "content": content}]
@@ -1290,6 +1308,24 @@ class PlanRunner:
                     ok = appearance_sim >= a.goal_memory_appearance_min_sim
                     dstate += (f" remembered_appearance_sim={appearance_sim:.2f}"
                                f"({'matches' if ok else 'MISMATCH -- possibly a different object'})")
+                # NavDP's currently-chosen trajectory endpoint (see
+                # DinoNavDPPipeline.get_recent_frames' sibling: this is
+                # NUMERIC NavDP context, cheap to add as text vs. an image).
+                # chosen[:, 0]=forward, [:, 1]=left, body frame at this tick.
+                traj = getattr(res, "trajectory", None) if res is not None else None
+                if traj is not None and len(traj) > 0:
+                    tf, tl = float(traj[-1, 0]), float(traj[-1, 1])
+                    dstate += f" navdp_planned_path=({tf:+.1f}m fwd, {tl:+.1f}m left)"
+                # Rolling text history of the supervisor's OWN past few
+                # verdicts this leg -- each check() call is otherwise
+                # completely stateless (a fresh judgment from one snapshot),
+                # so without this Qwen has no way to know "I've said
+                # searching 3 times in a row" vs. "I just started".
+                if sup_log:
+                    recent = "; ".join(f"t={s['t']:.0f}s:{s['status']}" for s in sup_log[-3:])
+                    dstate += f" recent_supervisor_history=[{recent}]"
+                history_frames = (node.pipe.get_recent_frames(n=a.supervisor_history_frames)
+                                  if a.supervisor_history_frames > 0 else None)
                 crop = None
                 if det is not None and rgb is not None:
                     try:
@@ -1302,7 +1338,8 @@ class PlanRunner:
                     except Exception:
                         crop = None
                 if rgb is not None:
-                    v = self.supervisor.check(rgb, phrase, node.target, dstate, crop=crop)
+                    v = self.supervisor.check(rgb, phrase, node.target, dstate, crop=crop,
+                                              history_frames=history_frames)
                     if v is not None:
                         v["t"] = round(now - t_start, 1)
                         sup_log.append(v)
@@ -1709,6 +1746,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--supervisor-retarget-lost-s", type=float, default=6.0,
                    help="only let the supervisor change the DINO phrase after DINO has had no "
                         "detection for this long (or the detection is ambiguous)")
+    p.add_argument("--supervisor-history-frames", type=int, default=0,
+                   help="give the Qwen supervisor N of NavDP's own recent buffered frames "
+                        "(DinoNavDPPipeline.get_recent_frames, 224x224, lower-res than the live "
+                        "frame) alongside the current view each check() call, so 'is progress being "
+                        "made' judgments aren't made from one frozen snapshot. 0 (default) = off -- "
+                        "each extra image adds real VLM latency at the 4s supervisor cadence; the "
+                        "cheap additions (NavDP's planned-path endpoint, the supervisor's own recent "
+                        "verdict history) are always on regardless of this flag.")
     p.add_argument("--search-creep-v", type=float, default=0.06,
                    help="forward speed while DINO has no lock -- replaces the pipeline's blind "
                         "in-place SEARCH spin so the view keeps changing (0 = spin in place)")

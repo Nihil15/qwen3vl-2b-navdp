@@ -884,6 +884,32 @@ class DinoNavDPPipeline:
         self._locked_embed = None
         self._qwen_locked_embed = []
 
+    def get_recent_frames(self, n: int = 2, exclude_current: bool = True) -> list:
+        """NavDP's own short-term visual memory (self._memory, fed to
+        policy.sample_pointgoal every step -- see the "update observation
+        memory" comment in step()), exposed for an external caller that
+        wants a look at what NavDP itself has been conditioning on, e.g.
+        TaskSupervisor giving Qwen the same short temporal context NavDP's
+        diffusion policy already has, instead of judging from a single
+        current frame every call.
+
+        Returns oldest-first HxWx3 uint8 RGB frames, cropped-and-padded to
+        NavDP's own 224x224 working resolution (see preprocess_rgb) -- NOT
+        full camera resolution, since that's not what's stored here. That
+        makes these visibly softer/smaller than the live frame a caller is
+        probably ALSO passing alongside them; fine for "what did the scene
+        look like a moment ago", not a substitute for the live frame.
+
+        exclude_current=True (default) drops the most recent entry, which
+        this same tick's step() call just appended and is essentially a
+        low-res duplicate of whatever full-res frame the caller already has
+        -- set False to include it anyway (e.g. no separate current frame
+        available)."""
+        frames = self._memory[:-1] if (exclude_current and self._memory) else list(self._memory)
+        if n > 0:
+            frames = frames[-n:]
+        return [np.clip(f * 255.0, 0, 255).astype(np.uint8) for f in frames]
+
     # weight given to a newly matched box when updating the tracked-box
     # reference. With several same-class objects close together, adjacent
     # boxes can each have decent overlap with the reference, and per-frame
