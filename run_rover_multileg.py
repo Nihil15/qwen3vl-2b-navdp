@@ -56,6 +56,16 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 # so --dry-run stays instant and doesn't need the heavy env.
 GuardConfig = DinoNavDPPipeline = PipelineConfig = DinoNavDPZenohNode = serialize_string = None
 LiveOccupancy = parse_string = None
+# fact3r-map's "entity memory" (SigLIP2 appearance embeddings) integrated
+# into the live rover's goal_memory: an OPT-IN twin of dinov2_embedder.py's
+# Dinov2Embedder (see nav_pipeline/siglip2_embedder.py), not the SAM2+SigLIP2
+# Fact3rEntityRecallGuide -- that one replaces the whole live grounder for an
+# in-session memory with no disk persistence; this instead adds ONE extra
+# field (`appearance_embedding`) onto the existing cross-session goal_memory
+# JSONL record, so a "go back to X" recall gets an appearance sanity check
+# on top of the existing text-label + odometry-point match, without changing
+# what already drives (DINO still grounds, Qwen still supervises).
+Siglip2Embedder = None
 # fact3r-map's own goal-memory storage/normalization (see
 # MASt3R-SLAM/fact3r-map/fact3r/semantics/goal_memory.py) -- reused directly
 # for its JSONL load/append + text-normalization utilities, which have zero
@@ -85,6 +95,10 @@ def _load_nav_pipeline():
     from nav_pipeline.live_occupancy import LiveOccupancy as _LO
     GuardConfig, DinoNavDPPipeline, PipelineConfig, DinoNavDPZenohNode, serialize_string = _GC, _P, _PC, _N, _ss
     LiveOccupancy, parse_string = _LO, _ps
+
+    global Siglip2Embedder
+    from nav_pipeline.siglip2_embedder import Siglip2Embedder as _SE
+    Siglip2Embedder = _SE
 
     global _goal_memory_load, _goal_memory_append, _goal_memory_normalize
     fact3r_map_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "MASt3R-SLAM", "fact3r-map")
@@ -412,6 +426,13 @@ class PlanRunner:
         self._last_memory_event: Optional[dict] = None   # for the GUI's Recall & Remember panel
         self._occ_origin = (0.0, 0.0)   # set once, in run(), at the session's launch pose
         self._pose_reset_done = False   # gates the ONE-TIME pose/self-check in run() (see there)
+        # fact3r-map entity-memory appearance check (see Siglip2Embedder's
+        # module docstring) -- lazily constructed on first actual use (an
+        # extra ~400MB model, opt-in via --goal-memory-appearance) so a run
+        # that never recalls anything never pays for it.
+        self.appearance_embedder = None
+        self._recalled_appearance_embedding: Optional[np.ndarray] = None  # set by _recall_and_approach,
+        # consumed once by the next object_leg's DINO loop, then cleared
 
     def _publish_status(self, kind: str, desc: str, detector: Optional[dict] = None,
                          supervisor: Optional[dict] = None, force: bool = False,
@@ -508,15 +529,58 @@ class PlanRunner:
             print(f"[occupancy] publish failed: {e}")
 
     # -- fact3r-map goal memory ------------------------------------------
-    def _remember_arrival(self, phrase: str, x: float, y: float):
+    def _ensure_appearance_embedder(self):
+        """Lazily build the SigLIP2 appearance embedder (fact3r-map entity-
+        memory integration -- see Siglip2Embedder's module docstring).
+        Returns None (never raises) if --goal-memory-appearance wasn't
+        passed, or if loading fails for any reason -- appearance checking is
+        a bonus signal on top of the existing text+odometry memory, never a
+        requirement for it to keep working."""
+        if not self.args.goal_memory_appearance:
+            return None
+        if self.appearance_embedder is not None:
+            return self.appearance_embedder
+        if Siglip2Embedder is None:
+            return None
+        try:
+            print("[memory] loading SigLIP2 for goal-memory appearance verification "
+                  f"({self.args.siglip_model_id}) ...")
+            self.appearance_embedder = Siglip2Embedder(model_id=self.args.siglip_model_id, device=self.args.device)
+        except Exception as e:
+            print(f"[memory] SigLIP2 appearance embedder failed to load ({e}) -- "
+                  "continuing with text+odometry-only memory")
+            self.appearance_embedder = None
+        return self.appearance_embedder
+
+    def _remember_arrival(self, phrase: str, x: float, y: float,
+                          det_box: Optional[np.ndarray] = None, rgb: Optional[np.ndarray] = None):
         if not self.args.goal_memory or _goal_memory_append is None:
             return
         try:
             ts = time.time()
-            _goal_memory_append(Path(self.args.goal_memory_path), {
+            record = {
                 "query_text": phrase, "world_xy": [round(float(x), 3), round(float(y), 3)], "ts": ts,
-            })
-            print(f"  [memory] recorded confirmed arrival at '{phrase}' -> ({x:+.2f},{y:+.2f})")
+            }
+            # fact3r-map entity-memory integration: bank ONE SigLIP2 view of
+            # the confirmed target alongside the text+point record, so a
+            # later recall can appearance-check what it finds against what
+            # was actually here -- see object_leg()'s call site for why
+            # det_box/rgb can legitimately be None (arrival declared on a
+            # tick DINO had just lost the box, e.g. close_loss) -- degrades
+            # gracefully to the pre-existing text+odometry-only record.
+            embedder = self._ensure_appearance_embedder()
+            if embedder is not None and det_box is not None and rgb is not None:
+                try:
+                    emb = embedder.embed(rgb, det_box)
+                    if emb is not None:
+                        record["appearance_embedding"] = [round(float(v), 5) for v in emb]
+                        record["appearance_model"] = self.args.siglip_model_id
+                except Exception as e:
+                    print(f"  [memory] appearance embed failed (recording text+point only): {e}")
+            _goal_memory_append(Path(self.args.goal_memory_path), record)
+            has_emb = "appearance_embedding" in record
+            print(f"  [memory] recorded confirmed arrival at '{phrase}' -> ({x:+.2f},{y:+.2f})"
+                  f"{' + appearance view' if has_emb else ''}")
             self._publish_status("object", phrase, force=True,
                                  memory={"event": "remembered", "phrase": phrase,
                                          "world_xy": [round(float(x), 3), round(float(y), 3)], "ts": ts})
@@ -534,6 +598,7 @@ class PlanRunner:
         whether a memory hit was found and used (not whether it fully
         closed the distance)."""
         a = self.args
+        self._recalled_appearance_embedding = None   # reset -- stale from a previous leg otherwise
         if not a.goal_memory or _goal_memory_load is None or _goal_memory_normalize is None:
             return False
         try:
@@ -553,6 +618,20 @@ class PlanRunner:
         age_s = time.time() - hit_ts
         print(f"  [{label}] [memory] recalling '{phrase}' from a confirmed arrival "
               f"{age_s:.0f}s ago at ({gx:+.2f},{gy:+.2f}) -- approaching before search")
+        # fact3r-map entity-memory integration: if this record banked a
+        # SigLIP2 view (see _remember_arrival), hand it to object_leg()'s
+        # own DINO loop below -- once handed off from this blind approach to
+        # a real DINO detection, that loop appearance-checks the FIRST live
+        # detection against this embedding and folds the result into the
+        # Qwen supervisor's context, instead of trusting the text label +
+        # odometry point alone the way this function's approach itself must
+        # (there's nothing to visually compare against yet while driving
+        # blind toward a remembered point with no live detection).
+        stored_emb = hit.get("appearance_embedding")
+        if stored_emb and self._ensure_appearance_embedder() is not None:
+            self._recalled_appearance_embedding = np.asarray(stored_emb, dtype=np.float32)
+            print(f"  [{label}] [memory] recalled view also carries an appearance signature -- "
+                  f"will sanity-check the first live re-detection against it")
         self._publish_status("object", phrase, force=True,
                              memory={"event": "recalled", "phrase": phrase,
                                      "world_xy": [gx, gy], "ts": hit_ts})
@@ -862,6 +941,16 @@ class PlanRunner:
               f'{" | Qwen supervisor/navigator" if self.supervisor is not None else ""}  (timeout {timeout:.0f}s)')
 
         used_memory = self._recall_and_approach(phrase, label) if a.goal_memory_approach else False
+        # Consume once -- _recall_and_approach() re-sets this fresh at the
+        # start of the NEXT object leg's own call, but clear it here too so
+        # nothing leaks if this leg's supervisor retargets DINO onto a
+        # DIFFERENT phrase mid-leg (see the retarget branch below): the
+        # remembered embedding was for the ORIGINAL recalled phrase only.
+        recalled_embedding = self._recalled_appearance_embedding
+        self._recalled_appearance_embedding = None
+        last_det_box = None       # last DINO box seen, for _remember_arrival's appearance embed
+        appearance_sim: Optional[float] = None      # set once, first live re-detection after recall
+        appearance_checked = False
 
         while not self._abort and not node._goal_reached:
             node._tick()
@@ -883,10 +972,35 @@ class PlanRunner:
             self._integrate_occupancy()
             if det is not None:
                 last_det_t = now
+                last_det_box = det.box
                 creep_anchor = None
                 if gp is not None:
                     last_goal_dist = float((gp[0] ** 2 + gp[1] ** 2) ** 0.5)
                     min_goal_dist = last_goal_dist if min_goal_dist is None else min(min_goal_dist, last_goal_dist)
+                # fact3r-map entity-memory integration: the FIRST live
+                # re-detection after a memory-recalled approach gets checked
+                # against the banked SigLIP2 view -- once, not every tick
+                # (an embed+compare call per tick would compete with
+                # predict_hz for GPU time for no added benefit; appearance
+                # doesn't change tick to tick). Feeds into the supervisor's
+                # dstate context below rather than silently vetoing anything
+                # -- the DINO box + supervisor judgment still have the final
+                # say, this is a sanity signal, not a hard gate.
+                if recalled_embedding is not None and not appearance_checked:
+                    appearance_checked = True
+                    with node.lock:
+                        rgb_now = node.latest_rgb
+                    if rgb_now is not None:
+                        try:
+                            emb = self.appearance_embedder.embed(rgb_now, det.box)
+                            if emb is not None:
+                                appearance_sim = Siglip2Embedder.cosine(emb, recalled_embedding)
+                                flag = "" if appearance_sim >= a.goal_memory_appearance_min_sim else \
+                                    "  ** LOW -- this may be a DIFFERENT object than the one remembered **"
+                                print(f"  [{label}] [memory] appearance check vs. recalled '{phrase}': "
+                                      f"sim={appearance_sim:.2f} (floor {a.goal_memory_appearance_min_sim:.2f}){flag}")
+                        except Exception as e:
+                            print(f"  [{label}] [memory] appearance check failed (ignoring): {e}")
 
             # -- ARRIVAL-ON-CLOSE-LOSS: DINO lost the lock while it was close
             #    (box fills the frame when you're on top of the object). Do NOT
@@ -946,6 +1060,10 @@ class PlanRunner:
                           f"stop_streak={node._stop_streak}/{node.stop_confirm_count}"
                           f"{' AMBIGUOUS(2+ matches, needs a distinguishing phrase)' if amb else ''} "
                           f"elapsed={now - t_start:.0f}s")
+                if appearance_sim is not None:
+                    ok = appearance_sim >= a.goal_memory_appearance_min_sim
+                    dstate += (f" remembered_appearance_sim={appearance_sim:.2f}"
+                               f"({'matches' if ok else 'MISMATCH -- possibly a different object'})")
                 crop = None
                 if det is not None and rgb is not None:
                     try:
@@ -1061,7 +1179,10 @@ class PlanRunner:
             # from farther out and stay excluded -- writing THEM would let
             # one bad guess poison every future "go back to X" for this
             # phrase.
-            self._remember_arrival(phrase, node.odom.x, node.odom.y)
+            with node.lock:
+                rgb_at_arrival = node.latest_rgb
+            self._remember_arrival(phrase, node.odom.x, node.odom.y,
+                                   det_box=last_det_box, rgb=rgb_at_arrival)
         res = dict(label=label, kind="object", instruction=phrase, final_target=node.target,
                    grounder=("Qwen-pixel" if node.pipe.cfg.use_qwen_instruction else "DINO"),
                    outcome=outcome, used_memory=used_memory,
@@ -1357,6 +1478,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--goal-memory-arrive-m", type=float, default=1.5,
                    help="stop the memory-guided approach once within this distance and hand off "
                         "to DINO -- never trust memory alone for the final approach")
+    # fact3r-map ENTITY memory integration -- see nav_pipeline/siglip2_embedder.py's
+    # module docstring for why SigLIP2 specifically (same encoder family
+    # fact3r-map's own entity/goal memory already standardizes on). Opt-in
+    # (extra ~400MB model, only relevant once --goal-memory-approach is also
+    # on -- there's nothing to visually compare against on a pure text+xy
+    # recall with no live re-detection yet).
+    p.add_argument("--goal-memory-appearance", action="store_true", default=False,
+                   help="opt-in: bank a SigLIP2 view of each confirmed arrival alongside the "
+                        "existing text+point record, and on a later recall, appearance-check the "
+                        "first live DINO re-detection against it -- a sanity signal folded into the "
+                        "Qwen supervisor's context (does NOT by itself block/override arrival; DINO "
+                        "+ the supervisor still decide). Requires --goal-memory-approach.")
+    p.add_argument("--siglip-model-id", type=str, default="google/siglip2-base-patch16-224")
+    p.add_argument("--goal-memory-appearance-min-sim", type=float, default=0.5,
+                   help="cosine similarity floor below which a re-detection is flagged as possibly "
+                        "a different object than the one remembered (advisory, not a hard veto)")
 
     # self-check
     p.add_argument("--odom-selfcheck", action="store_true", default=True,
@@ -1401,6 +1538,9 @@ def _config_summary(args) -> dict:
         odom_selfcheck=args.odom_selfcheck, imu_min_mag_calib=args.imu_min_mag_calib,
         serve=args.serve, occupancy=args.occupancy,
         goal_memory=args.goal_memory, goal_memory_path=args.goal_memory_path if args.goal_memory else None,
+        goal_memory_approach=args.goal_memory_approach,
+        goal_memory_appearance=(args.goal_memory_appearance and args.goal_memory_approach),
+        siglip_model_id=args.siglip_model_id if args.goal_memory_appearance else None,
     )
 
 

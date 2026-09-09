@@ -521,7 +521,15 @@ class MultilegViewer:
                                              # straight through to a fresh DINO search (see
                                              # _recall_and_approach: returns False immediately on no
                                              # hit, no behavior change for a never-seen target).
-                                             "--goal-memory-approach"])
+                                             "--goal-memory-approach",
+                                             # fact3r-map entity-memory integration (2026-09-09):
+                                             # bank a SigLIP2 view of each confirmed arrival, and on
+                                             # a later recall, appearance-check the first live
+                                             # re-detection against it -- advisory signal into the
+                                             # Qwen supervisor's context, doesn't override DINO/
+                                             # supervisor arrival on its own. See
+                                             # nav_pipeline/siglip2_embedder.py.
+                                             "--goal-memory-appearance"])
 
     def on_stop(self):
         self.runner.stop()
