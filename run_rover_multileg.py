@@ -268,6 +268,30 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
+# Small, dependency-free stopword list for _shares_key_word -- just enough
+# to strip the connective words a "go to X" clause/retarget phrase is built
+# from, so what's left is the actual noun(s) being compared.
+_STOPWORDS = frozenset(
+    "a an the go to towards near by next of at in on go-to and or".split())
+
+
+def _shares_key_word(a: str, b: str) -> bool:
+    """True if `a` and `b` share at least one non-stopword token, or one is
+    a substring of the other (handles "fan" vs "ceiling fan" for free).
+    Used to gate the supervisor's DINO retarget (see object_leg's retarget
+    branch) -- a legitimate paraphrase/landmark-narrowing of the object
+    actually being searched for shares a word with it; an unrelated object
+    Qwen noticed instead (e.g. "fan" -> "door") does not."""
+    a_norm, b_norm = a.strip().lower(), b.strip().lower()
+    if not a_norm or not b_norm:
+        return False
+    if a_norm in b_norm or b_norm in a_norm:
+        return True
+    a_words = {w for w in a_norm.split() if w not in _STOPWORDS}
+    b_words = {w for w in b_norm.split() if w not in _STOPWORDS}
+    return bool(a_words & b_words)
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """First balanced {...} block in a VLM reply -> dict, or None."""
     i = text.find("{")
@@ -1331,13 +1355,37 @@ class PlanRunner:
                         # retarget ONLY when DINO is genuinely lost or ambiguous --
                         # never yank the phrase while it is tracking cleanly
                         lost = now - last_det_t > a.supervisor_retarget_lost_s
+                        # `lost` alone is a WEAK signal to retarget on: not seeing
+                        # the target for supervisor_retarget_lost_s (default 6s)
+                        # is completely normal for the first stretch of an
+                        # ordinary SEARCH -- the object may just not be in frame
+                        # yet, exactly like a real "go to fan" leg where the fan
+                        # never was in view to begin with. Live-observed
+                        # 2026-09-09: with nothing else gating it, Qwen (seeing
+                        # no fan, something else salient instead) proposed
+                        # 'door' as the new target, and the WHOLE leg drove
+                        # there instead -- for an object the user never asked
+                        # for. `amb` needs no such gate (DINO itself already
+                        # found 2+ candidates OF THE SAME CLASS as `phrase`,
+                        # Qwen is only disambiguating among them). For `lost`,
+                        # require the proposed target to share a word with the
+                        # ORIGINAL requested phrase (not node.target, which may
+                        # have already drifted from an earlier retarget -- this
+                        # is the anti-drift anchor, see _shares_key_word) --
+                        # "white air cooler" -> "air cooler near window" passes,
+                        # "fan" -> "door" does not.
+                        on_topic = amb or _shares_key_word(phrase, v["target"])
                         if (v["target"] and v["target"] != node.target and len(v["target"]) <= 40
-                                and (lost or amb)):
+                                and (lost or amb) and on_topic):
                             print(f"  [{label}] supervisor retargets DINO ({'lost' if lost else 'ambiguous'}): "
                                   f"'{node.target}' -> '{v['target']}'")
                             node.target = v["target"]
                             node.pipe.reset()
                             node._stop_streak = 0
+                        elif v["target"] and v["target"] != node.target and lost and not on_topic:
+                            print(f"  [{label}] supervisor suggested '{v['target']}' while lost, but it "
+                                  f"doesn't share anything with the requested '{phrase}' -- ignoring, "
+                                  f"keeping DINO searching for '{node.target}'")
                         elif v["status"] == "wrong_object" and now - t_start >= a.supervisor_min_arrive_s:
                             print(f"  [{label}] supervisor: wrong lock -- resetting DINO acquisition")
                             node.pipe.reset()
@@ -1591,7 +1639,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="disable IMU heading fusion entirely -- theta is pure wheel-differential "
                         "dead reckoning. Use when the IMU heading channel is dead/frozen (confirmed "
                         "via: spin the rover, watch imu_heading_deg on /rover/rpm never change). "
-                        "Also skips the turn subtask's IMU-calibration wait.")
+                        "Also skips the turn subtask's IMU-calibration wait. Redundant with (but a "
+                        "faster start than) --auto-encoder-only's own detection.")
+    p.add_argument("--auto-encoder-only", dest="auto_encoder_only", action="store_true", default=True,
+                   help="on by default: self-detect a dead/frozen IMU heading channel live (see "
+                        "nav_pipeline/odometry_logger.py's _check_imu_alive -- reported heading "
+                        "unchanged across IMU_FREEZE_ROT_THRESH_RAD of REAL wheel-encoder-attested "
+                        "rotation while the mag calib byte claims it's trustworthy) and switch to "
+                        "encoder-only dead reckoning automatically, mid-run, the first time it fires. "
+                        "No manual --encoder-only needed for a fault that only shows up after the "
+                        "rover starts turning -- catches it within one bad turn instead of a whole run.")
+    p.add_argument("--no-auto-encoder-only", dest="auto_encoder_only", action="store_false",
+                   help="disable the self-detection above -- trust the IMU (or --encoder-only's "
+                        "manual override) for the whole run regardless of what it does")
 
     # object subtask
     p.add_argument("--rest-s", type=float, default=1.0, help="zero-velocity pause between subtasks")
@@ -1863,8 +1923,15 @@ def main():
                               imu_min_mag_calib=args.imu_min_mag_calib)
     if args.encoder_only:
         node.odom.encoder_only = True
+        node.odom.auto_detect_frozen_imu = False   # nothing left to detect -- already forced off
         print("[odometry] encoder-only mode: IMU heading fusion disabled, theta is pure "
               "wheel-differential dead reckoning (turn's IMU-calibration wait is skipped)")
+    else:
+        node.odom.auto_detect_frozen_imu = args.auto_encoder_only
+        if args.auto_encoder_only:
+            print("[odometry] auto-encoder-only detection armed: will self-switch to encoder-only "
+                  "dead reckoning if the IMU heading is ever caught frozen while calibrated "
+                  "(see nav_pipeline/odometry_logger.py's _check_imu_alive)")
 
     occupancy = None
     if args.occupancy:

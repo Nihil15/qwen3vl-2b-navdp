@@ -38,6 +38,22 @@ TRACK_WIDTH_M = 0.345
 # while still catching the first tick or two of a real ramp-up/down.
 MIN_MOVING_RPM = 0.5
 
+# Auto-frozen-IMU detection (see OdometryLogger._check_imu_alive): a dead
+# heading channel was previously only caught by a human watching the rover
+# spin and noticing imu_heading_deg never changed on /rover/rpm, then
+# manually re-launching with --encoder-only. These two thresholds make that
+# self-diagnosing: if the reported heading hasn't moved at all across this
+# much REAL rotation (attested by the wheel encoders, not the IMU itself --
+# see the shadow accumulator in update()), the channel is dead, not just
+# quiet, and encoder_only is flipped on automatically for the rest of the
+# run.
+IMU_FREEZE_ROT_THRESH_RAD = math.radians(20.0)
+# BNO08x reports heading at roughly 0.01deg resolution even standing still
+# (live-confirmed), so genuine sensor noise/precision is always well above
+# this -- anything smaller than this across the rotation threshold above
+# means the value plain isn't updating, not that it's unusually quiet.
+IMU_FREEZE_HEADING_EPS_DEG = 0.05
+
 
 class OdometryLogger:
     # retention for the spin_delta() rolling window -- must be >= the widest
@@ -45,7 +61,7 @@ class OdometryLogger:
     HISTORY_WINDOW_S = 30.0
 
     def __init__(self, log_dir: str = "odometry_log", imu_min_mag_calib: int = 3,
-                 encoder_only: bool = False):
+                 encoder_only: bool = False, auto_detect_frozen_imu: bool = True):
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
         self.path: Optional[str] = None
@@ -66,6 +82,18 @@ class OdometryLogger:
         # of the reported calib byte -- theta is pure wheel-differential dead
         # reckoning, same as before this IMU-fusion feature existed at all.
         self.encoder_only = encoder_only
+        # Self-diagnosing twin of the manual override above -- see
+        # _check_imu_alive() and the module-level threshold comments. Off
+        # automatically once encoder_only is already True (nothing to
+        # detect); pass False here to keep trusting a flagged-quiet IMU
+        # indefinitely instead (e.g. debugging the detector itself).
+        self.auto_detect_frozen_imu = auto_detect_frozen_imu and not encoder_only
+        self._enc_only_theta = 0.0   # shadow accumulator: ALWAYS encoder-integrated, regardless
+        # of theta_source, purely so a frozen IMU can be measured against
+        # real attested rotation -- never fed into the reported self.theta.
+        self._freeze_check_heading0: Optional[float] = None
+        self._freeze_check_enc_theta0 = 0.0
+        self.imu_declared_dead = False   # sticky, for a caller's status display
         self._imu_heading0_deg: Optional[float] = None
         self._last_imu_heading_deg_raw: Optional[float] = None
         self.theta_source = "enc"
@@ -196,12 +224,48 @@ class OdometryLogger:
         mag_ok = imu_calib is None or self._mag_calib_ok(imu_calib)
         if not (mag_ok and moving):
             self._imu_heading0_deg = math.degrees(self.theta) + imu_heading_deg
+            # Nothing to freeze-check while we wouldn't trust the IMU
+            # anyway -- restart the detection window fresh once we would.
+            self._freeze_check_heading0 = None
+            return None
+        self._check_imu_alive(imu_heading_deg)
+        if self.encoder_only:
+            # _check_imu_alive just declared it dead THIS tick -- don't fall
+            # through and return a trusted value from the very reading that
+            # triggered the declaration.
             return None
         if self._imu_heading0_deg is None:
             self._imu_heading0_deg = imu_heading_deg  # zero the reference at the first good sample (theta is 0 here)
         delta_deg = self._imu_heading0_deg - imu_heading_deg  # compass CW+ -> theta CCW+
         delta_deg = (delta_deg + 180.0) % 360.0 - 180.0
         return math.radians(delta_deg)
+
+    def _check_imu_alive(self, imu_heading_deg: float) -> None:
+        """Called only from inside _imu_theta's trusted branch (mag_ok AND
+        moving already true) -- so this is exactly the case a stuck-but-
+        confidently-calibrated heading is dangerous, unlike a never-
+        calibrated one (which the mag gate above already routes around
+        harmlessly). Flips self.encoder_only on, once, the first time the
+        raw reading hasn't moved across IMU_FREEZE_ROT_THRESH_RAD of REAL
+        rotation (self._enc_only_theta, updated every tick in update()
+        regardless of which source is currently driving self.theta)."""
+        if not self.auto_detect_frozen_imu or self.encoder_only:
+            return
+        if self._freeze_check_heading0 is None or \
+                abs(imu_heading_deg - self._freeze_check_heading0) > IMU_FREEZE_HEADING_EPS_DEG:
+            # First sample of a window, or proof of life -- (re)start it.
+            self._freeze_check_heading0 = imu_heading_deg
+            self._freeze_check_enc_theta0 = self._enc_only_theta
+            return
+        rotated = abs(self._enc_only_theta - self._freeze_check_enc_theta0)
+        if rotated > IMU_FREEZE_ROT_THRESH_RAD:
+            self.encoder_only = True
+            self.imu_declared_dead = True
+            print(f"[odometry] IMU heading channel appears DEAD/FROZEN -- reported "
+                  f"{imu_heading_deg:.2f}deg unchanged across {math.degrees(rotated):.0f}deg of REAL "
+                  f"wheel-encoder-attested rotation while calibrated. Switching to encoder-only dead "
+                  f"reckoning automatically for the rest of this run (pass --encoder-only next launch "
+                  f"to skip this detection window, or --no-auto-encoder-only to disable this check).")
 
     def update(self, left_rpm: float, right_rpm: float, t: Optional[float] = None,
                imu_heading_deg: Optional[float] = None, imu_calib: Optional[float] = None,
@@ -251,6 +315,7 @@ class OdometryLogger:
         dtheta = 0.0
         if dt > 0.0:
             dtheta = w * dt
+            self._enc_only_theta += dtheta   # shadow accumulator, see _check_imu_alive
             imu_theta = self._imu_theta(imu_heading_deg, imu_calib, moving)
             if imu_theta is not None:
                 self.theta = imu_theta
