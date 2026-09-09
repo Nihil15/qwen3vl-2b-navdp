@@ -14,5 +14,6 @@ checkpoints/
 # runtime output
 odometry_log/
 scene_log/
+logs/
 *.log
 *.csv

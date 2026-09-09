@@ -139,31 +139,51 @@ backend_bringup() {
     local need_camera=$1
 
     info "[$BACKEND] Pinging Pi at $PI_IP ..."
-    ping -c1 -W2 "$PI_IP" >/dev/null || { warn "Pi unreachable — is it ON and on this network?"; exit 1; }
+    # -c5 not -c1: this rover's wifi link drops the odd packet with 10-150ms
+    # jitter, and a single lost packet false-negatived as "unreachable".
+    ping -c5 -i0.5 -W2 "$PI_IP" >/dev/null 2>&1 || { warn "Pi unreachable — is it ON and on this network?"; exit 1; }
     $SSH 'echo ssh_ok' | grep -q ssh_ok || { warn "SSH failed (user=$PI_USER pass=\$PI_PASS)"; exit 1; }
     ok "Pi reachable"
 
     if [[ "$BACKEND" == "rover" ]]; then
-        local services n
+        local services n restart_camera=1
         if [[ "$need_camera" == "camera" ]]; then
             services="rover-camera rover-agent rover-zenoh"; n=3
+            # The D435i's RealSense pipeline does NOT reliably survive a cold
+            # `systemctl restart` while it's already streaming -- the fresh
+            # pipe.start() hits a "frame capture/align failed x5" crash-loop
+            # (RealSense SDK/USB re-init flakiness), the service exits for a
+            # clean systemd restart, and every consumer is starved of frames
+            # for 20-30s+ even though the camera was healthy moments earlier
+            # (observed live 2026-09-07). If rover-camera is already
+            # publishing (recent [STATUS] line), leave it completely alone.
+            if $SSH "journalctl -u rover-camera -n 6 --no-pager 2>/dev/null | grep -q '\[STATUS\]'" 2>/dev/null; then
+                restart_camera=0
+                ok "rover-camera already streaming -- not restarting it"
+                services="rover-agent rover-zenoh"; n=2
+            fi
         else
             services="rover-agent rover-zenoh"; n=2
         fi
-        info "Restarting rover services on Pi..."
+        info "Restarting rover services on Pi ($services)..."
         $SSH "echo $PI_PASS | sudo -S systemctl restart $services 2>/dev/null; sleep 4; systemctl is-active $services" \
             | grep -c active | grep -q "$n" && ok "services active: $services" \
             || warn "services not all active — run: bash scripts/pi_install_services.sh on the Pi"
 
         if [[ "$need_camera" == "camera" ]]; then
-            info "Waiting for camera topic (up to 25 s)..."
+            info "Waiting for camera to stream (up to 40 s)..."
+            # The camera publishes over raw Zenoh (image_raw/compressed), never
+            # bridged to ROS2, so `ros2 topic list` NEVER shows it -- the old
+            # check here always false-negatived. Watch the service's own
+            # [STATUS] color_published= line instead, and allow enough time
+            # for one crash-restart cycle if the restart above tripped it.
             local cam_ok=false
-            for i in $(seq 1 25); do
-                sleep 1
-                $SSH 'bash -lc "source /opt/ros/humble/setup.bash; ros2 topic list 2>/dev/null"' 2>/dev/null \
-                    | grep -q "/image_raw" && { cam_ok=true; ok "camera live [${i}s]"; break; }
+            for i in $(seq 1 20); do
+                sleep 2
+                $SSH "journalctl -u rover-camera -n 4 --no-pager 2>/dev/null | grep -q 'color_published='" 2>/dev/null \
+                    && { cam_ok=true; ok "camera streaming [$((i*2))s]"; break; }
             done
-            $cam_ok || warn "camera topic missing — check: ssh $PI_USER@$PI_IP 'journalctl -u rover-camera -n 20'"
+            $cam_ok || warn "camera not streaming — check: ssh $PI_USER@$PI_IP 'journalctl -u rover-camera -n 20'"
         fi
 
         info "Checking ESP32 heartbeat (/rover/rpm, up to 25 s)..."

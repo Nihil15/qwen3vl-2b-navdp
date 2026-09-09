@@ -29,4 +29,5 @@ cd "$(dirname "$0")"
 exec ./launch_instruction_gui.sh "$@" \
     --qwen-model-id Qwen/Qwen3-VL-2B-Instruct \
     --qwen-fp16 \
+    --qwen-appearance-lock \
     --stop-distance 0.5

@@ -52,7 +52,16 @@ export PI_PASS=<rover-pi-ssh-password>     # _backend.sh has no default (scrubbe
 ```
 
 `launch_instruction_gui_qwen3vl.sh` = the base launcher plus
-`--qwen-model-id Qwen/Qwen3-VL-2B-Instruct --qwen-fp16 --stop-distance 0.5`.
+`--qwen-model-id Qwen/Qwen3-VL-2B-Instruct --qwen-fp16 --qwen-appearance-lock
+--stop-distance 0.5`. The lock adds a small DINOv2 embedder and uses its
+multi-view bank to reject and rank Qwen's candidate pixels before the goal
+belief commits; other launchers remain default-off.
+
+For the cluttered-HM3D leg-1 failure, use
+`LAUNCH/launch_instruction_gui_qwen3vl_8b.sh`. It selects the locally cached
+Qwen3-VL-8B-Instruct grounder while retaining the same NavDP and safety stack.
+The 2B and 8B launchers are separate so constrained-GPU users do not silently
+take the larger model.
 
 The launch scripts assume a local conda setup (edit the `source .../conda.sh`
 line in `launch_instruction_gui.sh` for your machine) and a Pi running the
@@ -89,5 +98,7 @@ disable and revert to the drop-the-candidate behavior.
 | `qwen_instruction_period_s` | 1.5 s | throttle between Qwen calls; GoalBelief coasts in between |
 | `qwen_goal_consistency_m` | 1.5 m | reject a near re-grounding this far from the locked goal |
 | `qwen_max_candidates` | 3 | ranked candidates per call, scored on confidence + continuity + clearance |
+| `qwen_appearance_lock` | false | Qwen-only multi-view DINOv2 bank; filters and ranks candidates before belief commit |
+| `qwen_grounding_crops` | false | full frame plus focused crop proposals, selected by the same scorer; extra Qwen latency |
 | `qwen_far_lookahead_m` | 3.5 m | bearing-only look-ahead distance for far/untrusted-depth targets |
 | `qwen_depth_trust_horizon_m` | 6.0 m | depth beyond this is treated as bearing-only |

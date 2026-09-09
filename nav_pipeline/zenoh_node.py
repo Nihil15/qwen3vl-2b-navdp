@@ -350,6 +350,7 @@ class DinoNavDPZenohNode:
         self._stop_streak = 0
         self._goal_reached = False
         self._last_cmd = (0.0, 0.0)
+        self.last_result = None   # most recent StepResult (for external supervisors)
 
         self.pub_cmd = session.declare_publisher("cmd_vel")
         self.pub_explain = session.declare_publisher("omnivla/explanation")
@@ -511,6 +512,7 @@ class DinoNavDPZenohNode:
             print(f"[ERROR] pipeline step failed: {e}")
             self.publish_cmd(0.0, 0.0)
             return
+        self.last_result = res   # exposed for external supervisors (run_rover_multileg.py)
         infer_ms = (time.time() - t0) * 1000.0
 
         spin = self.odom.spin_delta(self.SPIN_WINDOW_S)

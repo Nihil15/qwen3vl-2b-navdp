@@ -44,7 +44,8 @@ class OdometryLogger:
     # window_s a caller will query
     HISTORY_WINDOW_S = 30.0
 
-    def __init__(self, log_dir: str = "odometry_log", imu_min_mag_calib: int = 3):
+    def __init__(self, log_dir: str = "odometry_log", imu_min_mag_calib: int = 3,
+                 encoder_only: bool = False):
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
         self.path: Optional[str] = None
@@ -58,6 +59,13 @@ class OdometryLogger:
         # existing 2-arg update(left_rpm, right_rpm) call site (zenoh_node.py,
         # isaac_gui.py, remind_gui.py) is byte-for-byte unaffected.
         self.imu_min_mag_calib = imu_min_mag_calib
+        # Hard override for a dead/frozen IMU heading channel (confirmed live
+        # 2026-09-09: imu_heading_deg stayed bit-identical across 6s of real,
+        # encoder-confirmed rotation -- the sensor isn't reporting at all, not
+        # just uncalibrated). When set, _imu_theta() never engages regardless
+        # of the reported calib byte -- theta is pure wheel-differential dead
+        # reckoning, same as before this IMU-fusion feature existed at all.
+        self.encoder_only = encoder_only
         self._imu_heading0_deg: Optional[float] = None
         self._last_imu_heading_deg_raw: Optional[float] = None
         self.theta_source = "enc"
@@ -125,7 +133,12 @@ class OdometryLogger:
         """Whether the last-seen IMU sample is trustworthy enough to be
         driving theta (see _imu_theta's gating below) -- i.e. the same
         MAG-only check, but queryable at any time (e.g. remind_gui.py's
-        status display) rather than only implicitly via theta_source."""
+        status display) rather than only implicitly via theta_source.
+        In encoder_only mode the IMU is never consulted, so a caller
+        waiting on this (e.g. a turn's calibration gate) should not block
+        on a sensor that's deliberately not in the loop -- report "ready"."""
+        if self.encoder_only:
+            return True
         return self._mag_calib_ok(self.last_imu_calib)
 
     def _mag_calib_ok(self, imu_calib: Optional[float]) -> bool:
@@ -176,6 +189,8 @@ class OdometryLogger:
         from wherever theta actually is, never jumps to a stale absolute
         reference.
         """
+        if self.encoder_only:
+            return None
         if imu_heading_deg is None or not math.isfinite(imu_heading_deg):
             return None
         mag_ok = imu_calib is None or self._mag_calib_ok(imu_calib)
@@ -296,5 +311,15 @@ class OdometryLogger:
         return turned, math.hypot(x1 - x0, y1 - y0)
 
     def close(self):
+        # Null both refs (not just close the fd) so a stray update() after
+        # close() -- e.g. the ESP32 /rover/rpm Zenoh callback still firing on
+        # its own thread between --serve instructions, see run_rover_multileg
+        # .py's PlanRunner._cleanup() -- hits the `self._writer is None` guard
+        # at the top of update() and returns cleanly instead of raising
+        # "ValueError: I/O operation on closed file" on every single sample
+        # (previously spammed the console and skipped _history bookkeeping
+        # for the rest of the process's life).
         if self._file is not None:
             self._file.close()
+            self._file = None
+            self._writer = None

@@ -210,6 +210,39 @@ class QwenVLPixelGoal:
         docstring. Caller (pipeline.py) scores each against goal continuity
         and obstacle cost and picks the winner; this method does no
         scoring of its own, just grounding."""
+        return self._ground_one(rgb, instruction, max_candidates)
+
+    def ground_candidates_with_crops(
+        self, rgb: np.ndarray, instruction: str, max_candidates: int = 3,
+        crop_fraction: float = 0.72, candidates_per_crop: int = 1,
+    ) -> List[PixelGoal]:
+        """Ground once with focused crops as visual context.
+
+        The final image is always the original camera frame, and Qwen returns
+        coordinates in that frame. The preceding left/centre/right crops give
+        a small VLM a closer look at distant objects. This is one multimodal
+        generation, not four sequential VLM calls, so it remains usable on a
+        moving rover.
+        """
+        h, w = rgb.shape[:2]
+        frac = min(max(float(crop_fraction), 0.35), 1.0)
+        if frac >= 0.999:
+            return self._ground_one(rgb, instruction, max_candidates)
+
+        if w >= h:
+            crop_w = max(2, int(round(w * frac)))
+            offsets = (0, max((w - crop_w) // 2, 0), max(w - crop_w, 0))
+            regions = [(x0, 0, crop_w, h) for x0 in dict.fromkeys(offsets)]
+        else:
+            crop_h = max(2, int(round(h * frac)))
+            offsets = (0, max((h - crop_h) // 2, 0), max(h - crop_h, 0))
+            regions = [(0, y0, w, crop_h) for y0 in dict.fromkeys(offsets)]
+
+        crops = [rgb[y0:y0 + ch, x0:x0 + cw] for x0, y0, cw, ch in regions]
+        return self._ground_one(rgb, instruction, max_candidates, context_crops=crops)
+
+    def _ground_one(self, rgb: np.ndarray, instruction: str, max_candidates: int,
+                    context_crops: Optional[List[np.ndarray]] = None) -> List[PixelGoal]:
         self._ensure_loaded()
         import torch
         from PIL import Image
@@ -217,9 +250,18 @@ class QwenVLPixelGoal:
         h, w = rgb.shape[:2]
         image = Image.fromarray(np.asarray(rgb, dtype=np.uint8))
         prompt = self.multi_prompt_template.format(instruction=instruction, max_candidates=max_candidates)
-        messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+        images = [Image.fromarray(np.asarray(crop, dtype=np.uint8)) for crop in (context_crops or [])]
+        if images:
+            prompt += (" The first images are enlarged overlapping views for identifying distant "
+                       "objects. The FINAL image is the original camera frame. Return coordinates "
+                       "only in the FINAL image. Do not choose an unrelated nearby wall, doorframe, "
+                       "railing, or floor.")
+        images.append(image)
+        content = [{"type": "image", "image": item} for item in images]
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}]
         text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self._processor(text=[text], images=[image], return_tensors="pt").to(self._model.device)
+        inputs = self._processor(text=[text], images=images, return_tensors="pt").to(self._model.device)
         with torch.no_grad():
             out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens_multi, do_sample=False)
         gen = out[0, inputs["input_ids"].shape[1]:]

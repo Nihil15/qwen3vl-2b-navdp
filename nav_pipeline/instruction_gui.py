@@ -227,6 +227,19 @@ def main():
                          "confidence + continuity with the current lock + obstacle-avoidance "
                          "cost (arxiv 2605.19420-inspired) -- 1 disables scoring, back to plain "
                          "single-point grounding. See PipelineConfig.qwen_max_candidates.")
+    ap.add_argument("--qwen-appearance-lock", action=argparse.BooleanOptionalAction, default=False,
+                    help="for Qwen instruction mode, rank multi-candidate pixel goals against a "
+                         "DINOv2 multi-view appearance bank before belief commits. Disabled by "
+                         "default because it loads the extra embedder; enabled by the Qwen3-VL "
+                         "launcher.")
+    ap.add_argument("--qwen-appearance-sim", type=float, default=0.55,
+                    help="minimum best-bank cosine similarity for a Qwen candidate once an "
+                         "appearance bank exists")
+    ap.add_argument("--qwen-candidate-appearance-weight", type=float, default=1.0,
+                    help="appearance-bank contribution when ranking otherwise valid Qwen candidates")
+    ap.add_argument("--qwen-grounding-crops", action=argparse.BooleanOptionalAction, default=False,
+                    help="also ground on overlapping focused views, then score mapped-back proposals; "
+                         "costs three extra Qwen calls per refresh")
     ap.add_argument("--qwen-fp16", action="store_true",
                     help="load Qwen2.5-VL-7B in fp16 instead of the 4-bit default (needs "
                          "~16.6GB VRAM vs 4-bit's ~6.2GB; use if bitsandbytes isn't installed)")
@@ -255,13 +268,17 @@ def main():
         # estimator actually run here.
         use_dino=False,
         use_sam=False,
-        use_appearance_reid=False,
+        use_appearance_reid=args.qwen_appearance_lock,
         use_qwen_instruction=True,   # this GUI has exactly one navigation mode
         stop_distance=args.stop_distance,
         qwen_model_id=args.qwen_model_id,
         qwen_instruction_period_s=args.qwen_instruction_period_s,
         qwen_goal_consistency_m=args.qwen_goal_consistency_m,
         qwen_max_candidates=args.qwen_max_candidates,
+        qwen_appearance_lock=args.qwen_appearance_lock,
+        qwen_appearance_min_similarity=args.qwen_appearance_sim,
+        qwen_candidate_appearance_weight=args.qwen_candidate_appearance_weight,
+        qwen_grounding_crops=args.qwen_grounding_crops,
         qwen_load_in_4bit=not args.qwen_fp16,
     ))
 

@@ -17,6 +17,7 @@ Returns a (linear, angular) velocity command plus rich debug info.
 """
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -138,6 +139,8 @@ def score_instruction_candidates(
     guard_cfg: GuardConfig, semantic_weight: float, continuity_weight: float,
     continuity_scale_m: float, collision_weight: float, collision_scale_m: float = 0.5,
     far_lookahead_m: float = 0.0, depth_trust_horizon_m: float = 0.0,
+    appearance_scores: Optional[list] = None, appearance_min_similarity: Optional[float] = None,
+    appearance_weight: float = 0.0,
 ) -> Optional[tuple]:
     """Score each qwen_pixel_goal.PixelGoal candidate's 3D goal (converted
     via depth) against semantic confidence, continuity with the current
@@ -146,6 +149,14 @@ def score_instruction_candidates(
     candidate, or None if none scored. See PipelineConfig.qwen_max_
     candidates for the full score formula and rationale (arxiv 2605.19420,
     adapted from a dense heatmap to a handful of discrete VLM candidates).
+
+    appearance_scores, when supplied, is parallel to ``candidates`` and holds
+    each crop's best cosine similarity to the Qwen appearance bank.  Candidates
+    below appearance_min_similarity are discarded *before* choosing a winner;
+    the remaining similarity is a ranking term.  ``None`` means that an
+    embedding could not be produced and deliberately preserves the old
+    geometry-only behavior for that candidate rather than turning a temporary
+    embedder failure into a false negative.
 
     Long-range handling (far_lookahead_m > 0): the monocular metric depth
     model is unreliable past ~6-8m, so a grounded pixel whose depth reads
@@ -167,8 +178,13 @@ def score_instruction_candidates(
     H, W = depth.shape[:2]
     best = None
     best_score = -np.inf
-    for cand in candidates:
+    for i, cand in enumerate(candidates):
         if not cand.in_view:
+            continue
+        appearance = (appearance_scores[i] if appearance_scores is not None
+                      and i < len(appearance_scores) else None)
+        if (appearance is not None and appearance_min_similarity is not None
+                and appearance < appearance_min_similarity):
             continue
         disc = _disc_mask(cand.u, cand.v, H, W, radius=14)
         d = mask_median_depth(depth, disc)
@@ -213,7 +229,8 @@ def score_instruction_candidates(
             if np.isfinite(clearance):
                 collision_cost = float(np.clip(1.0 - clearance / max(collision_scale_m, 1e-6), 0.0, 1.0))
 
-        score = sem + cont - collision_weight * collision_cost
+        app = appearance_weight * float(appearance) if appearance is not None else 0.0
+        score = sem + cont + app - collision_weight * collision_cost
         if score > best_score:
             best_score = score
             best = (xyz, cand, disc, far_mode)
@@ -281,6 +298,21 @@ class PipelineConfig:
     track_width_m: float = 0.345          # must match esp32/rover_6wd_complete.ino's TRACK_WIDTH_M
     wheel_vel_deadband_ms: float = 0.03   # must match esp32/rover_6wd_complete.ino's VEL_DEADBAND_MS
     avoid_confirm_ticks: int = 2     # consecutive guard hits before AVOID engages
+    avoid_stall_ticks: int = 10      # consecutive AVOID ticks with no real translation before the
+                                     # escape escalates to full authority. The graduated turn-rate
+                                     # below scales the escape by how far INSIDE hard_stop_dist the
+                                     # obstacle is, which leaves a dead band just inside the
+                                     # threshold: at min_fwd ~0.58 with hard_stop 0.60 / reverse
+                                     # 0.35, urgency ~0.08 gives a ~0.15 rad/s nudge while forward
+                                     # is already vetoed (v=0) and reverse hasn't armed yet (that
+                                     # needs min_fwd < reverse_dist). The rover then oscillates in
+                                     # a couple of degrees forever -- measured: 260 ticks, |v| mean
+                                     # 0.0003, yaw sweeping 22 deg, 10 distinct positions. Gentle
+                                     # turns are right for a passing obstacle and wrong for a
+                                     # wedge, and the two are only distinguishable by whether the
+                                     # rover is actually getting anywhere -- hence a stall test on
+                                     # measured displacement rather than a bigger constant.
+    avoid_stall_distance: float = 0.12  # net translation (m) over the stall window that counts as progress
     avoid_cooldown_ticks: int = 8    # keep biasing steering away from the escape side for this many
     #                                  more ticks after AVOID releases, so the rover actually clears the
     #                                  obstacle's lateral footprint before goal-bearing servo resumes --
@@ -369,6 +401,41 @@ class PipelineConfig:
     # pipeline would already give up and SEARCH), the gate stops applying --
     # that's a legitimate fresh acquisition, not a distractor.
     qwen_goal_consistency_m: float = 1.5
+    # Debounce before a Qwen-instruction goal is trusted enough to declare
+    # arrival -- same "don't act on one noisy reading" shape as
+    # avoid_confirm_ticks above, applied to the opposite failure direction.
+    # The DINO path's STOP has a box/appearance-gated detection behind it by
+    # the time it's close; Qwen's instruction grounding has none of that --
+    # once SEARCH gives up on the old lock, the very next re-grounding call
+    # is accepted unconditionally (no consistency gate applies to a genuinely
+    # fresh acquisition, see qwen_goal_consistency_m above), and if THAT one
+    # answer happens to read close (a wall, a doorframe, anything within
+    # stop_distance), the pipeline declared arrival on the spot -- a single
+    # bad frame ending navigation outright. Requiring this many consecutive
+    # ticks (grounded or belief-coasted) inside stop_distance before actually
+    # returning STOP gives one bad frame a chance to be corrected by the next
+    # real re-grounding instead of ending the episode on it. 1 = old behavior.
+    qwen_stop_confirm_ticks: int = 3
+    # How near the tracked goal must be for the obstacle guard's "a close
+    # reading in front IS probably the goal" branch to declare arrival --
+    # Qwen-instruction mode ONLY (DINO mode keeps guard.slow_dist, ~3.2m,
+    # exactly as before: a DINO detection carries a box + DINOv2 appearance
+    # re-id, so the premise genuinely holds there).
+    #
+    # slow_dist is far too permissive for a raw Qwen pixel-goal. Measured
+    # 2026-09-05 on a real HM3D hallway (bed target, identical A/B pair and
+    # start pose as an earlier clean 0.54m success): this branch fired 99
+    # times in a 220-tick leg -- 45% of all ticks -- on a coat rack, two
+    # different doors, and a staircase railing in turn, because ANY of them
+    # sitting within 3.2m of a slightly-off tracked goal satisfies it. A
+    # caller-level verifier (run_ab_position_recall_test.py's
+    # ArrivalVerifier) can reject each false arrival correctly and still
+    # lose 40-50% of the step budget to the escape maneuvers that follow,
+    # so the trigger RATE itself is what has to come down, not just the
+    # accept decision. 1.5m keeps real headroom over stop_distance (1.0-1.2m
+    # typical) so a genuine near-arrival still trips it, while a coincidental
+    # wall/door metres off the actual target no longer does.
+    qwen_avoid_stop_goal_dist: float = 1.5
     # Multi-candidate, obstacle-aware grounding (arxiv 2605.19420, "Beyond
     # Waypoints: Dual-Heatmap Grounding" -- adapted here to a frozen VLM
     # that can only be prompted for discrete points, not a dense heatmap
@@ -394,6 +461,14 @@ class PipelineConfig:
     qwen_candidate_collision_weight: float = 2.0     # weighted heavier -- safety, not preference
     qwen_candidate_collision_scale_m: float = 0.5    # clearance=0 -> cost 1, clearance>=this -> cost 0
     #   (deliberately NOT guard.slow_dist -- see score_instruction_candidates's comment on why)
+    # Proposal-side fix for small-Qwen clutter failures: make the full-frame
+    # query PLUS left/centre/right focused crops, then score every mapped-back
+    # proposal using the same safety/continuity/appearance machinery below.
+    # It is Qwen-only and off by default because it performs three additional
+    # grounding calls per refresh; the Qwen3 launcher enables it explicitly.
+    qwen_grounding_crops: bool = False
+    qwen_grounding_crop_fraction: float = 0.72
+    qwen_grounding_candidates_per_crop: int = 1
     # Long-range grounding: the monocular metric depth model is unreliable
     # past ~6-8m, so a grounded pixel whose depth is missing (a hole) or
     # reads farther than qwen_depth_trust_horizon_m is treated as a BEARING
@@ -466,6 +541,47 @@ class PipelineConfig:
     # appearance_min_similarity for a real match once apparent size changes,
     # which was repeatedly rejecting valid re-locks and cycling into SEARCH.
     appearance_iou_override: float = 0.6
+    # --- Qwen-instruction appearance lock -------------------------------- #
+    # The DINO path above has a real per-tick identity lock (reference box +
+    # DINOv2 embedding, see _select_detection). The Qwen-instruction path had
+    # NONE: its only continuity signals are geometric (belief_mu distance via
+    # score_instruction_candidates' continuity term, plus the
+    # qwen_goal_consistency_m gate), so nothing ever checks that the thing
+    # being grounded still LOOKS like what was originally locked onto.
+    #
+    # Measured need (2026-09-05, HM3D hallway, "go to the bed", identical
+    # episode replayed 4x): 3 of 4 runs landed at exactly 3.08m because Qwen
+    # grounded on doors and a staircase railing directly in front of the
+    # rover instead of the bed; the 1 run that reached 1.85m did so purely
+    # because its initial grounding happened to land on the real bed. Every
+    # other fix tried that day (a tightened STOP radius, a caller-level
+    # arrival verifier, escape tuning, instance-aware start/pair selection,
+    # step budget, mapping/A* work) addressed downstream symptoms of this
+    # one upstream gap and none moved the aggregate error.
+    #
+    # Off by default -- every existing launcher keeps exact current behavior.
+    # Requires use_appearance_reid (the DINOv2 embedder is loaded from that
+    # flag alone, independent of use_dino); silently inert without it.
+    # Threshold is deliberately looser than appearance_min_similarity (0.85):
+    # a Qwen pixel-goal crop is a fixed-size window around a point, not a
+    # detector box tracking the object's extent, so its apparent content
+    # shifts more between ticks as range/angle change.
+    qwen_appearance_lock: bool = False
+    # 0.55, not the DINO path's 0.85: measured on real crops here, a
+    # correctly re-grounded SAME object scores only 0.12-0.46 against a
+    # single reference (fixed-window crops aren't scale-invariant), and
+    # even against a multi-view bank the honest separation is modest.
+    # Set to reject clear mismatches without starving re-acquisition --
+    # geometric plausibility is enforced separately by
+    # qwen_goal_consistency_m, so this only has to catch the gross case.
+    qwen_appearance_min_similarity: float = 0.55
+    qwen_appearance_crop_px: int = 60
+    qwen_appearance_max_views: int = 5      # bank size, mirrors fact3r_entity_recall's 5-view bank
+    qwen_appearance_diversity_max: float = 0.97  # only bank a view that adds something new
+    # Once a bank exists, appearance participates in multi-candidate ranking,
+    # not merely a post-selection veto.  This lets a bank-consistent second
+    # Qwen proposal beat a visually wrong but geometrically tempting first one.
+    qwen_candidate_appearance_weight: float = 1.0
 
 
 def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -727,6 +843,8 @@ class DinoNavDPPipeline:
         self._avoid_streak = 0
         self._avoid_side = 0.0
         self._avoid_cooldown = 0
+        self._avoid_stall_ticks = 0                    # consecutive AVOID ticks without real translation
+        self._avoid_stall_anchor: Optional[tuple] = None  # pose when the current stall window opened
         self._prev_cmd = (0.0, 0.0)
         self._last_sam_t = 0.0
         self._last_mask: Optional[np.ndarray] = None
@@ -735,7 +853,9 @@ class DinoNavDPPipeline:
         self._last_candidate_count = 0
         self._ambiguity_warned = False
         self._locked_embed: Optional[np.ndarray] = None
+        self._qwen_locked_embed: list = []   # multi-view bank, see cfg.qwen_appearance_lock
         self._avoid_no_dino_warned = False  # print once per pipeline lifetime, not per reset()
+        self._qwen_stop_confirm_count = 0  # see PipelineConfig.qwen_stop_confirm_ticks
 
     def reset(self):
         self.belief.reset()
@@ -752,13 +872,17 @@ class DinoNavDPPipeline:
         self._avoid_streak = 0
         self._avoid_side = 0.0
         self._avoid_cooldown = 0
+        self._avoid_stall_ticks = 0
+        self._avoid_stall_anchor = None
         self._last_sam_t = 0.0
         self._last_mask = None
         self._last_mask_box = None
         self._prev_gray = None
         self._last_candidate_count = 0
+        self._qwen_stop_confirm_count = 0
         self._ambiguity_warned = False
         self._locked_embed = None
+        self._qwen_locked_embed = []
 
     # weight given to a newly matched box when updating the tracked-box
     # reference. With several same-class objects close together, adjacent
@@ -780,7 +904,9 @@ class DinoNavDPPipeline:
 
     def _select_detection(self, dets: list, motion: Optional[np.ndarray] = None,
                           rgb: Optional[np.ndarray] = None,
-                          initial_pick: Optional[Detection] = None) -> Optional[Detection]:
+                          initial_pick: Optional[Detection] = None,
+                          depth: Optional[np.ndarray] = None,
+                          intrinsics: Optional[tuple] = None) -> Optional[Detection]:
         """Pick which detection to track this frame.
 
         detect() returns boxes sorted by score, but with several instances of
@@ -860,8 +986,8 @@ class DinoNavDPPipeline:
         self._box_miss_count += 1
         if self._box_miss_count > self.cfg.lost_patience:
             self._box_miss_count = 0
-            det = self._select_by_appearance(dets, rgb) if (dets and self._locked_embed is not None) \
-                else (dets[0] if dets else None)
+            det = self._select_by_appearance(dets, rgb, depth=depth, intrinsics=intrinsics) \
+                if (dets and self._locked_embed is not None) else (dets[0] if dets else None)
             self._last_box = det.box if det is not None else self._last_box
             if det is not None:
                 new_embed = self._embed_or_none(rgb, det.box)
@@ -882,7 +1008,9 @@ class DinoNavDPPipeline:
         blended = e * new + (1 - e) * prior
         return blended / max(np.linalg.norm(blended), 1e-6)
 
-    def _select_by_appearance(self, dets: list, rgb: Optional[np.ndarray]) -> Optional[Detection]:
+    def _select_by_appearance(self, dets: list, rgb: Optional[np.ndarray],
+                              depth: Optional[np.ndarray] = None,
+                              intrinsics: Optional[tuple] = None) -> Optional[Detection]:
         """Reacquisition tiebreak: among same-class candidates with no spatial
         continuity left to lean on, prefer whichever one's crop looks most
         like the object we had locked before losing it (DINOv2 cosine
@@ -894,20 +1022,46 @@ class DinoNavDPPipeline:
         DIFFERENT physical instance of the same class instead of continuing
         to search for the one first locked onto. Returns None (refuse to
         reacquire, caller falls through to SEARCH) if nothing clears it.
+
+        When MORE THAN ONE candidate clears that floor -- the case that
+        defeats appearance alone: several visually near-identical instances
+        of the same class (e.g. a row of matching office chairs) whose crops
+        are indistinguishable to DINOv2, so "highest similarity" among them
+        is essentially a coin flip -- break the tie by proximity to
+        self.belief.mu (the propagated position of wherever the target
+        actually was) instead of raw similarity score. Live-observed without
+        this: reacquiring a DIFFERENT physical chair every time the lock
+        dropped, swinging the rover's heading through 260+deg with almost no
+        net approach progress. Falls back to pure appearance ranking if
+        depth/intrinsics are missing or belief isn't initialized/enabled --
+        exact prior behavior in every other config.
         """
         if self.reid is None or rgb is None or not dets:
             return None
-        best, best_sim = None, -1.0
+        qualifying = []
         for d in dets:
             emb = self.reid.embed(rgb, d.box)
             if emb is None:
                 continue
             sim = float(np.dot(emb, self._locked_embed))
-            if sim > best_sim:
-                best, best_sim = d, sim
-        if best is None or best_sim < self.cfg.appearance_min_similarity:
+            if sim >= self.cfg.appearance_min_similarity:
+                qualifying.append((d, sim))
+        if not qualifying:
             return None
-        return best
+        if (len(qualifying) == 1 or depth is None or intrinsics is None
+                or not (self.cfg.use_belief_goal and self.belief.initialized)):
+            return max(qualifying, key=lambda t: t[1])[0]
+        fx, fy, cx, cy = intrinsics
+        mu = self.belief.mu
+        best, best_d2 = None, None
+        for d, _sim in qualifying:
+            pt = goal_point_from_detection(d.box, depth, fx, fy, cx, cy)
+            if pt is None:
+                continue
+            d2 = float((pt[0] - mu[0]) ** 2 + (pt[1] - mu[1]) ** 2)
+            if best_d2 is None or d2 < best_d2:
+                best, best_d2 = d, d2
+        return best if best is not None else max(qualifying, key=lambda t: t[1])[0]
 
     # ------------------------------------------------------------------ #
     def _select_trajectory(self, trajs: np.ndarray, critic: np.ndarray, goal: np.ndarray,
@@ -1117,6 +1271,15 @@ class DinoNavDPPipeline:
                     "external_dets/external_goal given), but this pipeline was built with "
                     "use_dino=False. Pass an instruction instead, or rebuild with use_dino=True."
                 )
+            # Computed here (rather than only later, where the goal-from-
+            # detection path recomputes the identical values) so the
+            # ambiguity tiebreak below can use real geometry -- pure
+            # function of H/W/intrinsics, no side effects, safe to compute
+            # early.
+            if intrinsics is not None:
+                sel_fx, sel_fy, sel_cx, sel_cy = intrinsics
+            else:
+                sel_fx, sel_fy, sel_cx, sel_cy = intrinsics_from_fov(W, H, self.cfg.horizontal_fov_deg)
             relation = parse_relational_target(target_text)
             positional = None if relation is not None else parse_positional_target(target_text)
             if relation is not None:
@@ -1125,15 +1288,18 @@ class DinoNavDPPipeline:
                 target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
                 anchor_dets = [d for d in raw_dets if clean_label(d.label) == anchor_class]
                 initial_pick = select_by_relation(target_dets, anchor_dets) if self._last_box is None else None
-                det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+                det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick,
+                                             depth=depth, intrinsics=(sel_fx, sel_fy, sel_cx, sel_cy))
             elif positional is not None:
                 target_class, position = positional
                 raw_dets = self.detector.detect(rgb, f"{target_class}.")
                 target_dets = [d for d in raw_dets if clean_label(d.label) == target_class]
                 initial_pick = select_by_position(target_dets, position) if self._last_box is None else None
-                det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick)
+                det = self._select_detection(target_dets, motion=motion, rgb=rgb, initial_pick=initial_pick,
+                                             depth=depth, intrinsics=(sel_fx, sel_fy, sel_cx, sel_cy))
             else:
-                det = self._select_detection(self.detector.detect(rgb, target_text), motion=motion, rgb=rgb)
+                det = self._select_detection(self.detector.detect(rgb, target_text), motion=motion, rgb=rgb,
+                                             depth=depth, intrinsics=(sel_fx, sel_fy, sel_cx, sel_cy))
         timing["dino"] = time.time() - t0
 
         res.candidate_count = self._last_candidate_count
@@ -1253,6 +1419,26 @@ class DinoNavDPPipeline:
                             size_frac = (det.box[3] - det.box[1]) / H
                             print(f"[reid-debug] CLIP REJECTED score={score:.3f} < {self.cfg.clip_min_similarity} "
                                   f"box_h_frac={size_frac:.2f}")
+                    elif mask is None and self.clip is not None:
+                        # SAM found no mask for this box at all (common for a
+                        # huge/ambiguous box that fills most of the frame) --
+                        # this used to silently skip appearance verification
+                        # entirely, and the plain-bbox fallback below would
+                        # then accept the box on DINO's class match alone with
+                        # NO identity check. Live-observed: a "red box" search
+                        # locked onto some unrelated large nearby object with
+                        # no mask and no CLIP check, self-declaring STOP
+                        # within 4 ticks. Verify against the raw box crop
+                        # instead of skipping verification just because
+                        # segmentation didn't produce a mask this tick.
+                        t0 = time.time()
+                        score = self.clip.verify(rgb, det.box, target_text)
+                        timing["clip"] = time.time() - t0
+                        if score < self.cfg.clip_min_similarity:
+                            clip_rejected = True
+                            size_frac = (det.box[3] - det.box[1]) / H
+                            print(f"[reid-debug] CLIP REJECTED (no mask, raw box) score={score:.3f} < "
+                                  f"{self.cfg.clip_min_similarity} box_h_frac={size_frac:.2f}")
                     self._last_sam_t = now
                     self._last_mask = mask
                     self._last_mask_box = det.box.copy() if mask is not None else None
@@ -1292,11 +1478,41 @@ class DinoNavDPPipeline:
             now = time.time()
             if self._qwen_instruction_gate.due(now):
                 t0 = time.time()
-                candidates = self._qwen_pixel_guide.ground_candidates(
-                    rgb, instruction, max_candidates=self.cfg.qwen_max_candidates)
+                if self.cfg.qwen_grounding_crops:
+                    candidates = self._qwen_pixel_guide.ground_candidates_with_crops(
+                        rgb, instruction, max_candidates=self.cfg.qwen_max_candidates,
+                        crop_fraction=self.cfg.qwen_grounding_crop_fraction,
+                        candidates_per_crop=self.cfg.qwen_grounding_candidates_per_crop)
+                else:
+                    candidates = self._qwen_pixel_guide.ground_candidates(
+                        rgb, instruction, max_candidates=self.cfg.qwen_max_candidates)
                 timing["qwen_instruction"] = time.time() - t0
                 locked = (self.cfg.use_belief_goal and self.belief.initialized
                           and self.belief.sigma <= self.cfg.belief_max_sigma)
+                # Evaluate every offered Qwen candidate against the appearance
+                # bank BEFORE selecting the 3-D winner.  The previous code
+                # selected by semantic/geometry score, then vetoed that single
+                # winner; a correct lower-ranked candidate was therefore never
+                # considered.  Keep both arrays parallel to ``candidates`` so
+                # the selected embedding can be banked without a second DINOv2
+                # call.  With no established bank, the initial lock retains the
+                # old scoring behavior (there is no identity evidence yet).
+                candidate_embeds = [None] * len(candidates)
+                appearance_scores = None
+                if (self.cfg.qwen_appearance_lock and self.reid is not None
+                        and self._qwen_locked_embed):
+                    appearance_scores = []
+                    r = self.cfg.qwen_appearance_crop_px
+                    for i, cand in enumerate(candidates):
+                        if not cand.in_view:
+                            appearance_scores.append(None)
+                            continue
+                        box = np.array([cand.u - r, cand.v - r, cand.u + r, cand.v + r], dtype=np.float32)
+                        embed = self._embed_or_none(rgb, box)
+                        candidate_embeds[i] = embed
+                        appearance_scores.append(
+                            max(float(np.dot(embed, view)) for view in self._qwen_locked_embed)
+                            if embed is not None else None)
                 # Obstacle points computed here too (redundant with the guard
                 # section below, cheap -- a few ms) so goal SELECTION itself
                 # is collision-aware, not just avoidance after the fact. See
@@ -1313,6 +1529,11 @@ class DinoNavDPPipeline:
                     collision_scale_m=self.cfg.qwen_candidate_collision_scale_m,
                     far_lookahead_m=self.cfg.qwen_far_lookahead_m,
                     depth_trust_horizon_m=self.cfg.qwen_depth_trust_horizon_m,
+                    appearance_scores=appearance_scores,
+                    appearance_min_similarity=(self.cfg.qwen_appearance_min_similarity
+                                               if appearance_scores is not None else None),
+                    appearance_weight=(self.cfg.qwen_candidate_appearance_weight
+                                       if appearance_scores is not None else 0.0),
                 )
                 if winner is not None:
                     qgoal, pg, disc, far_mode = winner
@@ -1338,6 +1559,43 @@ class DinoNavDPPipeline:
                         print(f"[qwen-instruction-debug] far target -- depth untrusted, "
                               f"driving bearing to a {self.cfg.qwen_far_lookahead_m:.1f}m "
                               f"look-ahead goal and re-grounding as it closes")
+                    # Seed/update the multi-view bank only after all selection
+                    # gates pass.  Existing banks were already used inside
+                    # score_instruction_candidates above, so this is no longer
+                    # a post-selection identity veto.
+                    if qgoal is not None and self.cfg.qwen_appearance_lock and self.reid is not None:
+                        try:
+                            pg_index = candidates.index(pg)
+                        except ValueError:
+                            pg_index = -1
+                        cand_embed = candidate_embeds[pg_index] if pg_index >= 0 else None
+                        if cand_embed is None:
+                            r = self.cfg.qwen_appearance_crop_px
+                            box = np.array([pg.u - r, pg.v - r, pg.u + r, pg.v + r], dtype=np.float32)
+                            cand_embed = self._embed_or_none(rgb, box)
+                        if cand_embed is not None:
+                            # MULTI-VIEW bank, not one reference embedding.
+                            # Measured why (2026-09-05): a single blended
+                            # reference rejected 209 of 220 ticks at sim
+                            # 0.12-0.46 -- a fixed-size crop window around a
+                            # POINT (not a box tracking the object's extent)
+                            # changes content drastically with range/angle, so
+                            # the same real object scores nothing like itself
+                            # between ticks. This repo already hit and solved
+                            # exactly this for leg-2 recall by banking several
+                            # diverse views and matching against the BEST one
+                            # (fact3r_entity_recall.py: single-view 0.79-0.89
+                            # -> 5-view bank 0.95-0.99), so use that shape.
+                            # Geometric plausibility is still enforced
+                            # separately by qwen_goal_consistency_m above.
+                            if not self._qwen_locked_embed:
+                                self._qwen_locked_embed = [cand_embed]   # first lock
+                            else:
+                                sim = max(float(np.dot(cand_embed, e)) for e in self._qwen_locked_embed)
+                                if len(self._qwen_locked_embed) < self.cfg.qwen_appearance_max_views:
+                                    # bank a genuinely NEW viewpoint, not a near-duplicate
+                                    if sim < self.cfg.qwen_appearance_diversity_max:
+                                        self._qwen_locked_embed.append(cand_embed)
                     if qgoal is not None:
                         res.qwen_pixel_goal = (float(pg.u), float(pg.v))
                         res.mask = disc  # obstacle guard excludes the goal's own surface, same as a DINO/SAM mask
@@ -1345,10 +1603,18 @@ class DinoNavDPPipeline:
                         if self.cfg.use_belief_goal:
                             self.belief.observe(qgoal, confidence=pg.confidence)
                         if np.linalg.norm(qgoal[:2]) < self.cfg.stop_distance:
-                            res.state = "STOP"
-                            res.goal_point = qgoal
-                            res.timing = timing
-                            return res
+                            # See PipelineConfig.qwen_stop_confirm_ticks -- a fresh
+                            # Qwen acquisition (no box/appearance gate behind it,
+                            # unlike DINO) needs a few consecutive close readings,
+                            # not one, before arrival is trusted.
+                            self._qwen_stop_confirm_count += 1
+                            if self._qwen_stop_confirm_count >= self.cfg.qwen_stop_confirm_ticks:
+                                res.state = "STOP"
+                                res.goal_point = qgoal
+                                res.timing = timing
+                                return res
+                        else:
+                            self._qwen_stop_confirm_count = 0
                         goal = qgoal
         if goal is None and external_goal is not None:
             # Blind navigate-back: no live detection this tick, but the
@@ -1402,10 +1668,35 @@ class DinoNavDPPipeline:
                     # hard_stop_dist (a much closer, collision-avoidance-only
                     # threshold, not the intended 1.5m stop) was the only
                     # thing left to catch it.
-                    res.state = "STOP"
-                    res.goal_point = goal
-                    res.timing = timing
-                    return res
+                    #
+                    # In Qwen-instruction mode specifically, this also gates
+                    # a just-reacquired-after-SEARCH goal on the SAME
+                    # qwen_stop_confirm_ticks debounce as the live grounding
+                    # path above -- but deliberately does NOT increment the
+                    # counter itself here. This branch runs every coasting
+                    # tick regardless of whether a fresh Qwen call happened
+                    # this tick (belief.mu barely changes tick to tick while
+                    # stationary, sigma_visible=0.05 keeps it "confident" for
+                    # a long time), so incrementing on every coasted tick let
+                    # a SINGLE bad fresh grounding satisfy the whole debounce
+                    # in 2-3 ticks purely by not having moved since -- no
+                    # independent re-verification at all, defeating the
+                    # point. Only the fresh-grounding path above may
+                    # increment; this just checks whether enough independent
+                    # fresh confirmations have accumulated yet. DINO mode
+                    # already has a box/appearance-gated detection behind
+                    # this point, so it keeps the old single-tick behavior.
+                    if instruction and self._qwen_pixel_guide is not None:
+                        confirmed = self._qwen_stop_confirm_count >= self.cfg.qwen_stop_confirm_ticks
+                    else:
+                        confirmed = True
+                    if confirmed:
+                        res.state = "STOP"
+                        res.goal_point = goal
+                        res.timing = timing
+                        return res
+                elif instruction and self._qwen_pixel_guide is not None:
+                    self._qwen_stop_confirm_count = 0
             else:
                 if self.cfg.use_belief_goal:
                     reason = "sigma too high" if self.belief.initialized else "belief not initialized"
@@ -1423,6 +1714,7 @@ class DinoNavDPPipeline:
                 # rover test 2026-07-31: theta swung +116deg then reversed
                 # to -77deg hunting for a chair, never finding it).
                 res.state = "SEARCH"
+                self._qwen_stop_confirm_count = 0  # fully lost -- any streak so far no longer applies
                 qwen_angular = None
                 if self._qwen_scheduler is not None:
                     bearing = self._qwen_scheduler.step(time.time(), rgb, target_text)
@@ -1468,8 +1760,17 @@ class DinoNavDPPipeline:
             res.min_forward = min_fwd
             timing["guard"] = time.time() - t0
             if min_fwd < self.cfg.guard.hard_stop_dist:
+                # How near the tracked goal has to be for a close-in-front
+                # reading to count as "that IS the goal" instead of an
+                # obstacle. DINO mode keeps guard.slow_dist unchanged (a DINO
+                # detection has a box + appearance re-id behind it, so the
+                # premise holds there). Qwen-instruction mode uses a much
+                # tighter radius -- see qwen_avoid_stop_goal_dist.
+                qwen_mode = bool(instruction and self._qwen_pixel_guide is not None)
+                goal_near_dist = (self.cfg.qwen_avoid_stop_goal_dist if qwen_mode
+                                  else self.cfg.guard.slow_dist)
                 if (res.state == "TRACK" and goal is not None
-                        and np.linalg.norm(goal[:2]) < self.cfg.guard.slow_dist):
+                        and np.linalg.norm(goal[:2]) < goal_near_dist):
                     # A close-in-front reading this near our OWN live tracked
                     # goal is far more likely to BE the goal than a
                     # coincidental unrelated obstacle. exclude_mask above
@@ -1491,18 +1792,65 @@ class DinoNavDPPipeline:
                     # trusted as arrival there (see the GOTO branch's own
                     # docstring above) -- AVOID still applies normally on
                     # GOTO legs.
-                    res.state = "STOP"
-                    res.goal_point = goal
-                    self._avoid_streak = 0
-                    res.timing = timing
-                    return res
+                    #
+                    # In Qwen-instruction mode this used to fire in a single
+                    # tick, completely bypassing qwen_stop_confirm_ticks --
+                    # this gate's premise ("a close obstacle near our own
+                    # tracked goal is probably the goal") is much weaker for
+                    # a raw ungated Qwen pixel-goal than for a DINO detection
+                    # with a box/appearance check behind it (guard.slow_dist,
+                    # ~3.2m, is also far wider than stop_distance, so a wrong
+                    # early Qwen lock plus any nearby real wall/furniture --
+                    # exactly a doorway threshold -- tripped this on frame
+                    # one). Same debounce as the other two Qwen STOP sites.
+                    # Checks, does not increment -- same reasoning as the
+                    # belief-coasting site: this branch can be reached every
+                    # tick a close obstacle persists near a stale TRACK goal,
+                    # so incrementing here would let mere elapsed time (not
+                    # independent fresh re-groundings) satisfy the debounce.
+                    # Only the fresh-grounding site increments.
+                    if qwen_mode:
+                        avoid_stop_confirmed = self._qwen_stop_confirm_count >= self.cfg.qwen_stop_confirm_ticks
+                    else:
+                        avoid_stop_confirmed = True
+                    if avoid_stop_confirmed:
+                        res.state = "STOP"
+                        res.goal_point = goal
+                        self._avoid_streak = 0
+                        res.timing = timing
+                        return res
                 # hysteresis: monocular depth is noisy — require consecutive
                 # confirmations before engaging AVOID (prevents state flapping
                 # that looks like random movement)
                 self._avoid_streak += 1
                 if self._avoid_streak >= self.cfg.avoid_confirm_ticks:
                     res.state = "AVOID"
-                    res.linear = -0.5 * self.cfg.max_linear if min_fwd < self.cfg.guard.reverse_dist else 0.0
+                    # stall watch: has the rover actually gone anywhere while
+                    # avoiding? Compare against the pose the window opened at,
+                    # not the previous tick -- a rover oscillating in place
+                    # moves every tick but gets nowhere (see
+                    # PipelineConfig.avoid_stall_ticks).
+                    if pose is not None:
+                        if self._avoid_stall_anchor is None:
+                            self._avoid_stall_anchor = (float(pose[0]), float(pose[1]))
+                            self._avoid_stall_ticks = 0
+                        else:
+                            moved = math.hypot(float(pose[0]) - self._avoid_stall_anchor[0],
+                                               float(pose[1]) - self._avoid_stall_anchor[1])
+                            if moved >= self.cfg.avoid_stall_distance:
+                                self._avoid_stall_anchor = (float(pose[0]), float(pose[1]))
+                                self._avoid_stall_ticks = 0
+                            else:
+                                self._avoid_stall_ticks += 1
+                    wedged = self._avoid_stall_ticks >= self.cfg.avoid_stall_ticks
+                    # Wedged: back out. Normally reverse only arms below
+                    # reverse_dist, which is unreachable from the dead band
+                    # (forward is already vetoed, so the rover can't get
+                    # closer) -- so a stall is the only other way to earn it.
+                    if min_fwd < self.cfg.guard.reverse_dist or wedged:
+                        res.linear = -0.5 * self.cfg.max_linear
+                    else:
+                        res.linear = 0.0
                     # graduated turn-rate: full max_angular used to fire the
                     # instant hard_stop_dist was crossed, regardless of
                     # whether the obstacle was barely inside it or right on
@@ -1519,6 +1867,8 @@ class DinoNavDPPipeline:
                         / max(self.cfg.guard.hard_stop_dist - self.cfg.guard.reverse_dist, 1e-6),
                         0.0, 1.0,
                     )
+                    if wedged:
+                        urgency = 1.0   # graduated authority has demonstrably failed here
                     angular_mag = self.cfg.ang_min_cmd + urgency * (self.cfg.max_angular - self.cfg.ang_min_cmd)
                     res.angular = escape * angular_mag
                     # latch the escape side + re-arm the cooldown (every
@@ -1530,6 +1880,8 @@ class DinoNavDPPipeline:
                     return res
             else:
                 self._avoid_streak = 0
+                self._avoid_stall_ticks = 0
+                self._avoid_stall_anchor = None
 
         # --- NavDP ------------------------------------------------------ #
         t0 = time.time()
