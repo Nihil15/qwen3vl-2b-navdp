@@ -37,6 +37,26 @@ class Siglip2Embedder:
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModel.from_pretrained(model_id).to(device).eval()
 
+    @staticmethod
+    def _feats(out):
+        """`SiglipModel.get_{image,text}_features` returns a bare tensor on
+        recent transformers, but on some versions (and whenever `AutoModel`
+        resolves the siglip2 checkpoint through a generic head) it returns a
+        `ModelOutput` instead -- pull the pooled (B, D) vector out of it so the
+        L2-normalize below has a tensor to work on either way."""
+        import torch
+
+        if torch.is_tensor(out):
+            return out
+        for attr in ("text_embeds", "image_embeds", "pooler_output"):
+            v = getattr(out, attr, None)
+            if v is not None:
+                return v
+        lhs = getattr(out, "last_hidden_state", None)
+        if lhs is not None:
+            return lhs[:, -1] if lhs.dim() == 3 else lhs
+        return out[0]
+
     @torch.no_grad()
     def embed(self, rgb: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
         """L2-normalized SigLIP2 image-tower embedding of `box`'s crop, or None if degenerate."""
@@ -47,7 +67,7 @@ class Siglip2Embedder:
             return None
         crop = rgb[y0:y1, x0:x1]
         inputs = self.processor(images=[crop], return_tensors="pt").to(self.device)
-        feats = self.model.get_image_features(**inputs)
+        feats = self._feats(self.model.get_image_features(**inputs))
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats[0].float().cpu().numpy()
 
@@ -67,7 +87,7 @@ class Siglip2Embedder:
         max_length rather than the shortest-batch-member default.
         """
         inputs = self.processor(text=list(texts), padding="max_length", return_tensors="pt").to(self.device)
-        feats = self.model.get_text_features(**inputs)
+        feats = self._feats(self.model.get_text_features(**inputs))
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats.float().cpu().numpy()
 

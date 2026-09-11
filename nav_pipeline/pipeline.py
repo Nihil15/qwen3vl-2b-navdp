@@ -272,6 +272,13 @@ class PipelineConfig:
     max_linear: float = 0.15
     max_angular: float = 0.25
     waypoint_index: int = 8          # look-ahead waypoint on the chosen trajectory
+    navdp_angular_gain: float = 1.0  # multiplier on the angular command derived from NavDP's
+    #                                  chosen-trajectory waypoint (_command_from_trajectory).
+    #                                  <1 softens how hard the rover yaws to chase NavDP's
+    #                                  heading (still clipped to ±max_angular, and the near-
+    #                                  straight servo_deadband now applies here too so tiny
+    #                                  waypoint jitter commands 0); 0 = take speed from NavDP
+    #                                  but heading from the goal-bearing servo alone.
     # ── proven real-rover mechanics (ported from the OmniVLA node) ──
     # Steering in open space is a DETERMINISTIC visual servo on the detection
     # bearing (stable tick to tick), not the resampled diffusion heading.
@@ -1153,7 +1160,12 @@ class DinoNavDPPipeline:
             ramp_deg /= 1.0 + self.cfg.urgency_gain * (1.0 - min_forward / self.cfg.guard.slow_dist)
 
         angular = bearing_to_angular(heading, self.cfg.max_angular, self.cfg.ang_min_cmd,
-                                     0.0, np.radians(ramp_deg))
+                                     self.cfg.servo_deadband, np.radians(ramp_deg))
+        # optional gain reduction on NavDP's steering contribution (user knob):
+        # scale, then re-clip so |w| never exceeds the cap.
+        if self.cfg.navdp_angular_gain != 1.0:
+            angular = float(np.clip(self.cfg.navdp_angular_gain * angular,
+                                    -self.cfg.max_angular, self.cfg.max_angular))
 
         linear = np.clip(self.cfg.kp * dist, 0.0, self.cfg.max_linear)
         # slow down while turning hard (fraction of angular authority in use)

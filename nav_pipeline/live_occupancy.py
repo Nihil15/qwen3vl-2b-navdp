@@ -134,6 +134,66 @@ class LiveOccupancy:
     def set_fov(self, fov_deg: float) -> None:
         self._fov_deg = float(fov_deg)
 
+    # -- occlusion ---------------------------------------------------- #
+    def _ray_cells(self, r0: int, c0: int, r1: int, c1: int):
+        """Yield the grid cells a straight ray from (r0,c0) to (r1,c1)
+        passes through, in order, endpoints included. Same Bresenham stepping
+        as `_carve_free`, but as a read-only generator."""
+        dr, dc = abs(r1 - r0), abs(c1 - c0)
+        sr = 1 if r0 < r1 else -1
+        sc = 1 if c0 < c1 else -1
+        err = dr - dc
+        r, c = r0, c0
+        for _ in range(dr + dc + 2):
+            yield r, c
+            if (r, c) == (r1, c1):
+                break
+            e2 = 2 * err
+            if e2 > -dc:
+                err -= dc
+                r += sr
+            if e2 < dr:
+                err += dr
+                c += sc
+
+    def occlusion_shadow(self, pose_xy: Sequence[float], goal_xy: Sequence[float],
+                         beyond_m: float = 0.4):
+        """Walk the grid along the segment from `pose_xy` toward `goal_xy` and
+        return the first OCCUPIED cell the ray crosses, as
+        ``((hit_x, hit_y), opaque)``.
+
+        ``opaque`` is True iff the cells immediately beyond that hit (out to
+        ``beyond_m`` along the same ray) are all NOT FREE -- i.e. UNKNOWN, or
+        more wall -- meaning the obstacle is genuinely blocking the view of
+        whatever is behind it (decision: "occupied cell with UNKNOWN directly
+        behind it along the goal ray"). A hit with FREE cells right behind it
+        (a thin pole the rover can already see past) returns ``opaque=False``.
+        Look-ahead that runs entirely off the grid counts as opaque (nothing
+        observed beyond).
+
+        Returns ``None`` if the pose->goal ray leaves the grid, or reaches the
+        goal cell, without ever crossing an OCCUPIED cell.
+        """
+        r0, c0 = self.to_cell(float(pose_xy[0]), float(pose_xy[1]))
+        r1, c1 = self.to_cell(float(goal_xy[0]), float(goal_xy[1]))
+        cells = list(self._ray_cells(r0, c0, r1, c1))
+        n_beyond = max(1, int(round(beyond_m / self.res)))
+        for i, (r, c) in enumerate(cells):
+            if i == 0:
+                continue                       # the rover's own cell
+            if not self._in_bounds(r, c):
+                return None                    # ray left the grid before any hit
+            if self.grid[r, c] != OCCUPIED:
+                continue
+            look = cells[i + 1: i + 1 + n_beyond]
+            in_grid = [(rr, cc) for rr, cc in look if self._in_bounds(rr, cc)]
+            if not in_grid:
+                opaque = True                  # nothing mapped beyond the hit
+            else:
+                opaque = all(self.grid[rr, cc] != FREE for rr, cc in in_grid)
+            return self.to_world(r, c), bool(opaque)
+        return None
+
     # -- planning ------------------------------------------------------- #
     def _clearance_from_mask(self, not_wall: np.ndarray, robot_radius: float) -> np.ndarray:
         """Shared distance-transform core for `clearance` (mask = FREE only)

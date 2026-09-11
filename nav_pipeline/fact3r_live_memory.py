@@ -299,6 +299,80 @@ class LiveEntity:
     def similarity(self, embedding: np.ndarray) -> float:
         return max(float(np.dot(embedding, e)) for e in self.embeddings)
 
+    # -- cross-session persistence ---------------------------------- #
+    def to_dict(self, with_crops: bool = True) -> dict:
+        """JSON-safe view. ``embeddings`` + ``positions`` + the quality
+        arrays are always kept (enough for text-query recall + position
+        weighting); ``crops``/``context_crops`` (needed only for VLM
+        ``verify()``) are kept as base64 PNG when ``with_crops`` so a
+        restored map can still be Qwen-verified."""
+        d = {
+            "entity_id": self.entity_id,
+            "embeddings": [np.asarray(e, dtype=np.float32).round(6).tolist() for e in self.embeddings],
+            "positions": [[float(x), float(y)] for (x, y) in self.positions],
+            "qualities": [float(q) for q in self.qualities],
+            "depths": [float(v) for v in self.depths],
+            "view_qualities": [float(q) for q in self.view_qualities],
+            "first_step": int(self.first_step),
+            "last_step": int(self.last_step),
+        }
+        if with_crops:
+            d["crops"] = [_png_b64(c) for c in self.crops]
+            d["context_crops"] = [_png_b64(c) for c in self.context_crops]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LiveEntity":
+        ent = cls(
+            entity_id=str(d.get("entity_id", "live-?")),
+            embeddings=[np.asarray(e, dtype=np.float32) for e in d.get("embeddings", [])],
+            positions=[(float(p[0]), float(p[1])) for p in d.get("positions", [])],
+            qualities=[float(q) for q in d.get("qualities", [])],
+            depths=[float(v) for v in d.get("depths", [])],
+            view_qualities=[float(q) for q in d.get("view_qualities", [])],
+            first_step=int(d.get("first_step", -1)),
+            last_step=int(d.get("last_step", -1)),
+        )
+        for key in ("crops", "context_crops"):
+            for b in d.get(key, []):
+                img = _png_b64_decode(b)
+                if img is not None:
+                    getattr(ent, key).append(img)
+        # observe()'s full-bank eviction indexes crops/context_crops by the
+        # argmin of view_qualities -- keep those aligned even if crops were
+        # dropped on save (with_crops=False) so that path can't IndexError.
+        if ent.crops and len(ent.view_qualities) != len(ent.crops):
+            ent.view_qualities = ent.view_qualities[:len(ent.crops)]
+        elif not ent.crops:
+            ent.view_qualities = []
+        return ent
+
+
+def _png_b64(img: np.ndarray) -> str:
+    import base64
+    import io
+
+    from PIL import Image
+
+    arr = np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    buf = io.BytesIO()
+    Image.fromarray(arr[:, :, :3]).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _png_b64_decode(b: str) -> "Optional[np.ndarray]":
+    try:
+        import base64
+        import io
+
+        from PIL import Image
+
+        return np.asarray(Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB"), dtype=np.uint8)
+    except Exception:
+        return None
+
 
 class Fact3rLiveMemory:
     def __init__(
@@ -338,6 +412,18 @@ class Fact3rLiveMemory:
         self._siglip = None
         self._proc = None
         self.entities: List[LiveEntity] = []
+        # Monotonic id source. Was ``f"live-{len(self.entities):04d}"`` in
+        # observe(), which COLLIDES after merge_nearby_duplicates() shrinks
+        # the list -- a later observe() then reuses an id that already
+        # exists (seen live: 'live-0008' appearing 4x in one saved map),
+        # making save/load and shortlist logging ambiguous. A counter that
+        # only ever goes up fixes it; load() bumps it past any restored id.
+        self._id_counter = 0
+
+    def _new_id(self) -> str:
+        eid = f"live-{self._id_counter:04d}"
+        self._id_counter += 1
+        return eid
 
     # -- models ------------------------------------------------------- #
     def _ensure_loaded(self) -> None:
@@ -365,6 +451,27 @@ class Fact3rLiveMemory:
         with torch.inference_mode():
             return self._sam.generate(image)
 
+    @staticmethod
+    def _pooled(out):
+        """`get_{image,text}_features` returns a bare tensor on some
+        transformers versions and a ``ModelOutput`` on others (and whenever
+        ``AutoModel`` resolves the siglip2 checkpoint through a generic
+        head) -- pull the (B, D) pooled vector out either way. Same guard
+        siglip2_embedder.Siglip2Embedder._feats uses; needed here since the
+        navdp env's transformers 5.x returns the wrapped object."""
+        import torch
+
+        if torch.is_tensor(out):
+            return out
+        for attr in ("image_embeds", "text_embeds", "pooler_output"):
+            v = getattr(out, attr, None)
+            if v is not None:
+                return v
+        lhs = getattr(out, "last_hidden_state", None)
+        if lhs is not None:
+            return lhs[:, -1] if lhs.dim() == 3 else lhs
+        return out[0]
+
     def _embed_images(self, crops) -> Optional[np.ndarray]:
         import torch
         from PIL import Image
@@ -374,7 +481,7 @@ class Fact3rLiveMemory:
         pil = [Image.fromarray(np.ascontiguousarray(c)) for c in crops]
         inputs = self._proc(images=pil, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            feats = self._siglip.get_image_features(**inputs)
+            feats = self._pooled(self._siglip.get_image_features(**inputs))
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats.float().cpu().numpy()
 
@@ -385,7 +492,7 @@ class Fact3rLiveMemory:
         inputs = self._proc(text=[text], return_tensors="pt", padding="max_length",
                             truncation=True).to(self.device)
         with torch.no_grad():
-            feats = self._siglip.get_text_features(**inputs)
+            feats = self._pooled(self._siglip.get_text_features(**inputs))
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats[0].float().cpu().numpy()
 
@@ -501,7 +608,7 @@ class Fact3rLiveMemory:
                     best.view_qualities[worst] = quality
                 best.last_step = step
             else:
-                ent = LiveEntity(entity_id=f"live-{len(self.entities):04d}",
+                ent = LiveEntity(entity_id=self._new_id(),
                                  embeddings=[emb], positions=[(ox, oy)],
                                  crops=[np.ascontiguousarray(crop)],
                                  context_crops=[np.ascontiguousarray(ccrop)],
@@ -708,7 +815,19 @@ class Fact3rLiveMemory:
         return (best_xy, best_sim) if best_xy is not None else None
 
     # -- recall ------------------------------------------------------- #
-    def query(self, text: str, min_observations: int = 2, min_score: float = 0.0):
+    @staticmethod
+    def _passes_depth(ent: "LiveEntity", max_median_depth_m: Optional[float]) -> bool:
+        """Drop entities whose observations are mostly FAR: pixel->metric
+        unprojection error grows with depth, so a background wall/object
+        first seen at 7-8 m has a garbage position (and a noisy SigLIP crop)
+        and only pollutes the shortlist. ``None``/<=0 disables; an entity
+        with no stored depths (older record) is never excluded."""
+        if not max_median_depth_m or max_median_depth_m <= 0 or not ent.depths:
+            return True
+        return float(np.median(ent.depths)) <= max_median_depth_m
+
+    def query(self, text: str, min_observations: int = 2, min_score: float = 0.0,
+              max_median_depth_m: Optional[float] = None):
         """Text -> (entity, position, score) for the best-matching entity that
         has enough observations to trust its geometry. Nothing needs to be in
         view: the answer is a stored position."""
@@ -720,6 +839,8 @@ class Fact3rLiveMemory:
         ranked = []
         for ent in self.entities:
             if ent.observations < min_observations:
+                continue
+            if not self._passes_depth(ent, max_median_depth_m):
                 continue
             score = ent.similarity(text_emb)
             ranked.append((score, ent))
@@ -879,7 +1000,8 @@ class Fact3rLiveMemory:
         return verdict
 
     def query_verified(self, text: str, qwen, min_observations: int = 3, top: int = 6,
-                       min_confidence: float = 0.5, max_position_spread: float = 2.0):
+                       min_confidence: float = 0.5, max_position_spread: float = 2.0,
+                       max_median_depth_m: Optional[float] = None, verbose: bool = False):
         """fact3r's real two-stage retrieval: SigLIP shortlist -> Qwen3-VL
         verification -> the stored POSITION of the best accepted entity.
 
@@ -898,7 +1020,18 @@ class Fact3rLiveMemory:
         still catches genuine fragmentation (two comparable-weight clusters
         read as high spread there too), so this isn't just loosening the
         gate -- see that property's docstring."""
-        shortlist = self.ranked(text, min_observations=min_observations, top=top)
+        shortlist = self.ranked(text, min_observations=min_observations, top=top,
+                                max_median_depth_m=max_median_depth_m)
+        if verbose:
+            print(f"    [fact3r.query_verified] text='{text}'  |{len(self.entities)} entities| "
+                  f"-> SigLIP shortlist of {len(shortlist)} (min_obs={min_observations}, "
+                  f"top={top}, max_depth={max_median_depth_m}):")
+            for score, ent in shortlist:
+                ex, ey = ent.position
+                md = float(np.median(ent.depths)) if ent.depths else float('nan')
+                print(f"      {ent.entity_id}  siglip={score:+.3f}  obs={ent.observations}  "
+                      f"xy=({ex:+.2f},{ey:+.2f})  spread={ent.position_spread:.2f}m "
+                      f"(w {ent.position_spread_weighted:.2f})  medDepth={md:.1f}m")
         records, accepted = [], []
         for score, ent in shortlist:
             trust_spread = min(ent.position_spread, ent.position_spread_weighted)
@@ -912,24 +1045,79 @@ class Fact3rLiveMemory:
                               "reason": f"position spread {ent.position_spread:.2f} m "
                                         f"(weighted {ent.position_spread_weighted:.2f} m) exceeds "
                                         f"{max_position_spread:.2f} m -- no trustworthy position"}
+                if verbose:
+                    print(f"      -> {ent.entity_id}: SKIPPED before VLM ({rec['vlm']['reason']})")
             else:
+                if verbose:
+                    print(f"      -> {ent.entity_id}: Qwen verify ({len(ent.context_crops or ent.crops)} "
+                          f"crop(s)) vs '{text}' ...")
                 rec["vlm"] = self.verify(text, ent, qwen)
+                if verbose:
+                    v = rec["vlm"]
+                    print(f"         Qwen: decision={v.get('decision')} conf={v.get('confidence', 0):.2f} "
+                          f"predicted='{v.get('predicted_object', '')}' reason=\"{v.get('reason', '')[:140]}\"")
                 if rec["vlm"]["decision"] == "yes" and rec["vlm"]["confidence"] >= min_confidence:
                     accepted.append((rec["vlm"]["confidence"], float(score), ent, rec))
+                elif verbose:
+                    print(f"         -> not accepted (need decision=yes AND conf>="
+                          f"{min_confidence})")
             records.append(rec)
         if not accepted:
+            if verbose:
+                print(f"    [fact3r.query_verified] RESULT: no entity accepted for '{text}'")
             return None, None, None, records
         accepted.sort(key=lambda t: (-t[0], -t[1]))
         _, _, ent, rec = accepted[0]
+        if verbose:
+            print(f"    [fact3r.query_verified] RESULT: {ent.entity_id} accepted "
+                  f"(conf={rec['vlm']['confidence']:.2f}) -> position {tuple(round(v, 2) for v in ent.position)}")
         return ent, ent.position, rec, records
 
-    def ranked(self, text: str, min_observations: int = 2, top: int = 5):
+    def ranked(self, text: str, min_observations: int = 2, top: int = 5,
+               max_median_depth_m: Optional[float] = None):
         """Same scoring, but returns the whole shortlist for reporting."""
         self._ensure_loaded()
         prompts = [text, f"a photo of {text}", f"{text} in an indoor scene"]
         text_emb = np.mean([self.embed_text(p) for p in prompts], axis=0)
         text_emb = text_emb / (np.linalg.norm(text_emb) + 1e-12)
         out = [(ent.similarity(text_emb), ent) for ent in self.entities
-               if ent.observations >= min_observations]
+               if ent.observations >= min_observations
+               and self._passes_depth(ent, max_median_depth_m)]
         out.sort(key=lambda t: -t[0])
         return out[:top]
+
+    # -- cross-session persistence ---------------------------------- #
+    def save(self, path, with_crops: bool = True) -> int:
+        """Dump every entity to one JSON file (see LiveEntity.to_dict).
+        Returns the entity count written."""
+        import json as _json
+        from pathlib import Path as _Path
+
+        p = _Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "entities": [e.to_dict(with_crops=with_crops) for e in self.entities]}
+        p.write_text(_json.dumps(payload), encoding="utf-8")
+        return len(self.entities)
+
+    def load(self, path, replace: bool = True) -> int:
+        """Restore entities from a save() file. ``replace`` (default) swaps
+        the current list; otherwise appends. Returns how many were loaded.
+        Missing file -> 0, no error."""
+        import json as _json
+        from pathlib import Path as _Path
+
+        p = _Path(path)
+        if not p.exists():
+            return 0
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        loaded = [LiveEntity.from_dict(d) for d in data.get("entities", [])]
+        self.entities = loaded if replace else (self.entities + loaded)
+        # keep _new_id() ahead of every restored id so a post-load observe()
+        # can't collide with one
+        for e in self.entities:
+            try:
+                n = int(str(e.entity_id).rsplit("-", 1)[-1])
+                self._id_counter = max(self._id_counter, n + 1)
+            except (ValueError, TypeError):
+                pass
+        return len(loaded)

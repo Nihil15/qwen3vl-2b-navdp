@@ -70,6 +70,25 @@ class OdometryLogger:
         self.x = self.y = self.theta = 0.0
         self._last_t: Optional[float] = None
         self._history: deque = deque()  # (t, x, y, theta, |dtheta| this tick), newest last
+        # Session-long drift-risk odometer -- unlike x/y/theta (a single
+        # pose estimate) or _history (a 30s rolling window for spin_delta),
+        # these only ever grow, from start_new_goal()'s very first sample
+        # until reset_pose() (an explicit operator re-anchor). Neither the
+        # continuous pose NOR the log-file-per-goal rotation resets them --
+        # see run_rover_multileg.py's goal_memory recall, which banks a
+        # snapshot of these at each confirmed arrival and compares against
+        # the CURRENT value at recall time: the gap is a measure of how much
+        # unanchored dead-reckoning has happened since, i.e. how much to
+        # trust world_xy right now, not just how long ago it was written.
+        self.total_dist_m = 0.0        # cumulative |v|*dt -- bounds worst-case x/y drift
+        self.total_enc_rot_rad = 0.0   # cumulative |dtheta| ONLY while theta_source=="enc" --
+        # i.e. rotation that happened UNANCHORED by the IMU (see _imu_theta):
+        # wheel-diff heading free-runs on wheel slip whenever the IMU isn't
+        # trusted (mag uncalibrated, or auto-detected frozen), and that error
+        # then multiplies into every subsequent meter of x/y integration
+        # until the IMU re-locks (or never, in --encoder-only). Deliberately
+        # NOT counting imu-anchored rotation here: an IMU-driven turn doesn't
+        # accumulate error the same way (see update()'s docstring).
         # Optional IMU heading fusion (see update()'s imu_heading_deg/imu_calib
         # args) -- off unless a caller actually passes those, so every
         # existing 2-arg update(left_rpm, right_rpm) call site (zenoh_node.py,
@@ -139,6 +158,10 @@ class OdometryLogger:
         self._history.clear()
         self._imu_heading0_deg = None
         self.theta_source = "enc"
+        # An explicit re-anchor invalidates whatever drift-risk had built up
+        # against the OLD origin -- see the odometer comment in __init__.
+        self.total_dist_m = 0.0
+        self.total_enc_rot_rad = 0.0
 
     @staticmethod
     def decode_calib(imu_calib: Optional[float]) -> str:
@@ -328,6 +351,9 @@ class OdometryLogger:
             # the original x += v*cos(theta)*dt / y += v*sin(theta)*dt exactly.
             self.x += (v * math.cos(self.theta) - lateral * math.sin(self.theta)) * dt
             self.y += (v * math.sin(self.theta) + lateral * math.cos(self.theta)) * dt
+            self.total_dist_m += abs(v) * dt
+            if self.theta_source == "enc":
+                self.total_enc_rot_rad += abs(dtheta)
 
         imu_field = f"{imu_heading_deg:.4f}" if imu_heading_deg is not None and math.isfinite(imu_heading_deg) else ""
         lateral_field = f"{lateral_m_s:.4f}" if lateral_m_s is not None else ""

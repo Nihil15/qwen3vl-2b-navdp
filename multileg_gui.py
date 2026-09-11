@@ -58,12 +58,23 @@ STATUS_KEYS = ["multileg/status", "rt/multileg/status"]
 WAYPOINTS_KEYS = ["omnivla/waypoints", "rt/omnivla/waypoints"]
 RECORD_STATUS_KEYS = ["mast3r_record/status", "rt/mast3r_record/status"]
 OCCUPANCY_KEYS = ["multileg/occupancy", "rt/multileg/occupancy"]
+FACT3R_KEYS = ["multileg/fact3r", "rt/multileg/fact3r"]
 RAW_W, RAW_H = 640, 480   # frame size DINO's box coordinates are in
 RUNNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_rover_multileg.py")
 # Matches run_rover_multileg.py's own --goal-memory-path default -- read
 # directly off disk rather than over Zenoh, since it's a small local file
 # and this way the panel works the same for a GUI-launched or bare CLI run.
 GOAL_MEMORY_PATH = os.path.join(os.path.dirname(RUNNER_PATH), "logs", "live_goal_memory.jsonl")
+# Experiment log: a JSON array, one object per completed subtask
+# (move/turn/object), tagged with whatever's in the "Experiment no." box at
+# the moment it finished -- lets several experiment runs in one session be
+# compared by path length / outcome later without re-parsing every
+# logs/rover_multileg_*/result.json. Each row also carries the odometry CSV
+# filename (the raw (t,x,y,theta,v,w,...) trace path_length_m was integrated
+# from -- see run_rover_multileg.py's _leg_odometry_csv) and, once per plan,
+# the straight-line distance from the session origin to that plan's first
+# subtask (run_rover_multileg.py's origin_to_plan_start_m).
+EXPERIMENT_LOG_PATH = os.path.join(os.path.dirname(RUNNER_PATH), "logs", "experiment_log.json")
 RECORDER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "..", "MASt3R-SLAM", "scripts", "record_rover_live.py")
 RECORDER_OUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -106,6 +117,8 @@ class SharedState:
         self.record_status_t = 0.0
         self.occupancy_png: Optional[bytes] = None   # raw PNG bytes, decoded lazily in refresh()
         self.occupancy_t = 0.0
+        self.fact3r: Optional[dict] = None   # {entities:[{id,xy,obs,depth_m,spread_m}], recalled_id, ...}
+        self.fact3r_t = 0.0
 
 
 def zenoh_setup(session: zenoh.Session, st: SharedState):
@@ -151,6 +164,14 @@ def zenoh_setup(session: zenoh.Session, st: SharedState):
         with st.lock:
             st.occupancy_png, st.occupancy_t = bytes(sample.payload), time.time()
 
+    def on_fact3r(sample):
+        try:
+            payload = json.loads(parse_string(bytes(sample.payload)))
+        except Exception:
+            return
+        with st.lock:
+            st.fact3r, st.fact3r_t = payload, time.time()
+
     subs = (
         [session.declare_subscriber(k, on_image) for k in CAMERA_KEYS]
         + [session.declare_subscriber(k, on_image_compressed) for k in CAMERA_COMPRESSED_KEYS]
@@ -158,6 +179,7 @@ def zenoh_setup(session: zenoh.Session, st: SharedState):
         + [session.declare_subscriber(k, on_waypoints) for k in WAYPOINTS_KEYS]
         + [session.declare_subscriber(k, on_record_status) for k in RECORD_STATUS_KEYS]
         + [session.declare_subscriber(k, on_occupancy) for k in OCCUPANCY_KEYS]
+        + [session.declare_subscriber(k, on_fact3r) for k in FACT3R_KEYS]
     )
     return subs
 
@@ -329,7 +351,7 @@ class MultilegViewer:
     NAVDP_RANGE_M = 4.0
 
     def __init__(self, root: tk.Tk, st: SharedState, pi_ip: Optional[str], session: zenoh.Session,
-                 default_instruction: str = ""):
+                 default_instruction: str = "", supervisor_model: str = "Qwen/Qwen3-VL-2B-Instruct"):
         self.root = root
         self.st = st
         self.session = session
@@ -358,10 +380,20 @@ class MultilegViewer:
         col2 = ttk.Frame(main)
         col2.grid(row=0, column=1, sticky="n", padx=(0, 10))
         ttk.Label(col2, text="Subtask plan", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
-        self.plan_frame = ttk.Frame(col2)
-        self.plan_frame.pack(anchor="w", fill="x", pady=(2, 8))
-        self.plan_rows: list = []
+        # tk.Text (not ttk.Label rows) so the plan is selectable + copy-pastable
+        # (click-drag or Ctrl+A then Ctrl+C) -- state="disabled" still allows
+        # selection/copy, it only blocks typing, same as self.log_text below.
+        self.plan_text = tk.Text(col2, width=54, height=8, bg="#111", fg="#ddd",
+                                 font=("Courier", 9), wrap="none", state="disabled",
+                                 relief="flat", padx=4, pady=2)
+        self.plan_text.pack(anchor="w", fill="x", pady=(2, 8))
+        self.plan_text.tag_configure("done_ok", foreground="#2e7d32")
+        self.plan_text.tag_configure("done_bad", foreground="#c62828")
+        self.plan_text.tag_configure("running", foreground="#f9a825", font=("Courier", 9, "bold"))
+        self.plan_text.tag_configure("pending", foreground="#888888")
         self._plan_len = -1
+        self._logged_subtask_keys: set = set()   # (label, dur_s) already written to EXPERIMENT_LOG_PATH,
+        # so a reconnect / replayed status doesn't double-log the same completed subtask
 
         # Odometry-trail panel removed: the BEV occupancy panel below already
         # carries a live pose+heading marker in the same world frame, so a
@@ -404,6 +436,15 @@ class MultilegViewer:
         self.instr_entry.pack(anchor="w", pady=(2, 4), fill="x")
         self.instr_entry.bind("<Return>", lambda e: self.on_launch())
 
+        exp_row = ttk.Frame(col3)
+        exp_row.pack(anchor="w", pady=(0, 4), fill="x")
+        ttk.Label(exp_row, text="Experiment no.:").pack(side="left")
+        self.experiment_var = tk.StringVar(value="1")
+        ttk.Entry(exp_row, textvariable=self.experiment_var, width=10).pack(side="left", padx=(4, 8))
+        ttk.Label(exp_row, text="-- tags every subtask's path-length row below and in "
+                                f"{os.path.basename(EXPERIMENT_LOG_PATH)}",
+                  foreground="#666", wraplength=280, justify="left").pack(side="left")
+
         sup_row = ttk.Frame(col3)
         sup_row.pack(anchor="w", pady=(0, 4), fill="x")
         ttk.Label(sup_row, text="Supervisor:").pack(side="left")
@@ -411,10 +452,13 @@ class MultilegViewer:
         # reliable choice all session. 7B/8B are heavier VLM judges but the
         # 7B fp16 fallback (no bitsandbytes here) hung indefinitely on this
         # box at least once -- offered, not defaulted to.
-        self.supervisor_var = tk.StringVar(value="Qwen/Qwen3-VL-2B-Instruct")
+        _sup_choices = ["Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen3-VL-8B-Instruct",
+                        "Qwen/Qwen2.5-VL-7B-Instruct"]
+        if supervisor_model and supervisor_model not in _sup_choices:
+            _sup_choices.insert(0, supervisor_model)
+        self.supervisor_var = tk.StringVar(value=supervisor_model or _sup_choices[0])
         ttk.Combobox(sup_row, textvariable=self.supervisor_var, state="readonly", width=30,
-                    values=["Qwen/Qwen3-VL-2B-Instruct", "Qwen/Qwen3-VL-8B-Instruct",
-                            "Qwen/Qwen2.5-VL-7B-Instruct"]).pack(side="left", padx=(4, 0))
+                    values=_sup_choices).pack(side="left", padx=(4, 0))
 
         self.server_line = ttk.Label(col3, text="server: not started", foreground="#888")
         self.server_line.pack(anchor="w", pady=(0, 2))
@@ -458,8 +502,25 @@ class MultilegViewer:
         self._memory_mtime = -1.0   # != any real mtime (or the 0.0 used when the file doesn't exist
         self._memory_records: list = []   # yet) so the panel populates ("no memory yet") on the first tick
 
+        # ---- column 5: fact3r LIVE entity map (id + location) ------------
+        # Distinct from column 4: that is the JSONL goal-memory of confirmed
+        # DINO arrivals; THIS is the SAM2+SigLIP2 entity map built from every
+        # frame while driving (run_rover_memfirst_dino.py, published on
+        # 'multileg/fact3r'). "go to X" queries this first.
+        col5 = ttk.Frame(main)
+        col5.grid(row=0, column=4, sticky="n", padx=(10, 0))
+        self.fact3r_head = ttk.Label(col5, text="fact3r entities (live map)",
+                                     font=("TkDefaultFont", 12, "bold"))
+        self.fact3r_head.pack(anchor="w")
+        ttk.Label(col5, text="every object SAM2 sees while driving, with a metric "
+                             "position. ★ = the one the last “go to X” recalled.",
+                  wraplength=280, justify="left", foreground="#666").pack(anchor="w", pady=(0, 4))
+        self.fact3r_list = tk.Listbox(col5, width=40, height=30, bg="#111", fg="#ddd",
+                                      font=("Courier", 9), selectbackground="#333")
+        self.fact3r_list.pack(anchor="w")
+
         self.conn_line = ttk.Label(root, text="waiting for data...", foreground="#888")
-        self.conn_line.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 4))
+        self.conn_line.grid(row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(4, 4))
 
         self.pi_ip = pi_ip
         self.log_queue: "queue.Queue[str]" = queue.Queue()
@@ -516,8 +577,9 @@ class MultilegViewer:
                                              # degree bearing jitter commands a >5x larger angular
                                              # rate, which read as the rover spinning hard even while
                                              # cleanly TRACKing a real detection. Bring it back down
-                                             # to the tuned value.
-                                             "--max-angular", "0.25",
+                                             # to the tuned value. (2026-09-10: +20% per user
+                                             # request, 0.25 -> 0.30.)
+                                             "--max-angular", "0.30",
                                              # Per user request 2026-09-09: query goal-memory on
                                              # EVERY object leg -- recall and approach the remembered
                                              # point first if one matches this phrase, otherwise fall
@@ -532,7 +594,13 @@ class MultilegViewer:
                                              # Qwen supervisor's context, doesn't override DINO/
                                              # supervisor arrival on its own. See
                                              # nav_pipeline/siglip2_embedder.py.
-                                             "--goal-memory-appearance"])
+                                             "--goal-memory-appearance",
+                                             # Give the Qwen supervisor NavDP's own last 2 buffered
+                                             # frames alongside the live view each check() call, so
+                                             # "is progress being made" isn't judged from one frozen
+                                             # snapshot every 4s. See TaskSupervisor.check()'s
+                                             # history_frames param / DinoNavDPPipeline.get_recent_frames.
+                                             "--supervisor-history-frames", "2"])
 
     def on_stop(self):
         self.runner.stop()
@@ -624,35 +692,90 @@ class MultilegViewer:
         self._photo = ImageTk.PhotoImage(img)
         self.cam_label.configure(image=self._photo)
 
-    def _rebuild_plan_rows(self, plan: list):
-        for w in self.plan_rows:
-            w.destroy()
-        self.plan_rows = []
-        for i, desc in enumerate(plan):
-            lbl = ttk.Label(self.plan_frame, text=f"{i + 1}. {desc}", width=42, anchor="w")
-            lbl.grid(row=i, column=0, sticky="w")
-            self.plan_rows.append(lbl)
-        self._plan_len = len(plan)
-
     def _update_plan(self, status: dict):
         plan = status.get("plan") or []
-        if len(plan) != self._plan_len:
-            self._rebuild_plan_rows(plan)
         cur = status.get("current_index", -1)
         results = status.get("results") or []
+        cur_path_m = status.get("current_path_length_m")
         good = ("ok", "reached_dino", "reached_supervisor", "reached_close_loss", "reached_supervisor_approx")
-        for i, lbl in enumerate(self.plan_rows):
+        lines = []   # (text, tag)
+        for i, desc in enumerate(plan):
             matching = [r for r in results if str(r.get("label", "")).startswith(f"{i}_")]
             if matching:
-                outcome = matching[-1].get("outcome", "?")
-                color = "#2e7d32" if outcome in good else "#c62828"
-                lbl.configure(text=f"done {i + 1}. {plan[i]}  -> {outcome}", foreground=color)
+                r = matching[-1]
+                outcome = r.get("outcome", "?")
+                path_m = r.get("path_length_m")
+                path_txt = f"  path={path_m:.2f}m" if path_m is not None else ""
+                lines.append((f"done {i + 1}. {desc}  -> {outcome}{path_txt}\n",
+                              "done_ok" if outcome in good else "done_bad"))
             elif i == cur:
-                lbl.configure(text=f"-> {i + 1}. {plan[i]}  (running)", foreground="#f9a825",
-                              font=("TkDefaultFont", 10, "bold"))
+                path_txt = f"  path={cur_path_m:.2f}m" if cur_path_m is not None else ""
+                lines.append((f"-> {i + 1}. {desc}  (running){path_txt}\n", "running"))
             else:
-                lbl.configure(text=f"   {i + 1}. {plan[i]}", foreground="#bbbbbb",
-                              font=("TkDefaultFont", 10))
+                lines.append((f"   {i + 1}. {desc}\n", "pending"))
+        # Only rewrite when the rendered text actually changed -- re-inserting
+        # every ~120ms refresh tick (even with identical content) would drop
+        # whatever the user just selected to copy, mid-selection.
+        rendered = "".join(t for t, _ in lines)
+        if rendered != getattr(self, "_plan_rendered", None):
+            self._plan_rendered = rendered
+            self.plan_text.configure(state="normal", height=max(3, min(len(lines), 20)))
+            self.plan_text.delete("1.0", "end")
+            for text, tag in lines:
+                self.plan_text.insert("end", text, tag)
+            self.plan_text.configure(state="disabled")
+        self._plan_len = len(plan)
+        self._log_new_subtasks(results, status.get("origin_to_plan_start_m"))
+
+    def _log_new_subtasks(self, results: list, origin_to_plan_start_m: Optional[float]):
+        """Append one JSON row per newly-completed subtask to EXPERIMENT_LOG_PATH
+        (a JSON array on disk -- read, extend, rewrite), tagged with the
+        current 'Experiment no.' box, so several experiments in one session
+        can be compared by path length / odometry trace later. Each
+        (label, dur_s) is logged once; dur_s in the key distinguishes a RETRY
+        of the same label (see run_rover_multileg.py's orchestrator retry).
+        odometry_csv + origin_to_plan_start_m come straight from the backend
+        (run_rover_multileg.py's _leg_odometry_csv / origin_to_plan_start_m) --
+        the raw (t,x,y,theta,v,w,...) trace and the distance already
+        travelled from the session origin before this plan's first subtask."""
+        new_rows = []
+        for r in results:
+            key = (r.get("label"), r.get("dur_s"))
+            if key in self._logged_subtask_keys:
+                continue
+            self._logged_subtask_keys.add(key)
+            new_rows.append(r)
+        if not new_rows:
+            return
+        exp_no = self.experiment_var.get().strip() or "1"
+        instruction = self.instr_entry.get().strip()
+        now_s = time.strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for r in new_rows:
+            target = r.get("instruction") or r.get("target_m") or r.get("target_deg") or ""
+            rows.append({
+                "experiment_no": exp_no, "logged_at": now_s, "instruction": instruction,
+                "subtask_label": r.get("label"), "kind": r.get("kind"), "target": target,
+                "path_length_m": r.get("path_length_m"), "dur_s": r.get("dur_s"),
+                "outcome": r.get("outcome"), "odometry_csv": r.get("odometry_csv"),
+                "origin_to_plan_start_m": origin_to_plan_start_m,
+            })
+        try:
+            os.makedirs(os.path.dirname(EXPERIMENT_LOG_PATH), exist_ok=True)
+            existing = []
+            if os.path.exists(EXPERIMENT_LOG_PATH):
+                try:
+                    with open(EXPERIMENT_LOG_PATH) as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        existing = loaded
+                except Exception:
+                    pass   # corrupt/foreign file -- don't lose new rows over it, start fresh below
+            existing.extend(rows)
+            with open(EXPERIMENT_LOG_PATH, "w") as f:
+                json.dump(existing, f, indent=2)
+        except Exception as e:
+            self._log(f"[gui] experiment log write failed: {e}\n")
 
     def _draw_navdp(self, traj: List[Tuple[float, float]], age: Optional[float]):
         c = self.navdp_canvas
@@ -744,6 +867,41 @@ class MultilegViewer:
                 self.memory_list.insert("end", f"{r.get('query_text', '?')[:22]:22} {loc:16} {age_min:5.1f}m ago")
 
     # -- main loop --------------------------------------------------------
+    def _refresh_fact3r_panel(self, fact3r: Optional[dict], age: Optional[float]):
+        ents = (fact3r or {}).get("entities") or []
+        recalled = (fact3r or {}).get("recalled_id")
+        # The entity map lives only in the --serve process. Once that's gone
+        # (server shut down, GUI about to be closed) the feed stops -- drop
+        # the rows so stale entities don't linger on screen.
+        gone = age is not None and age > 12.0
+        if gone:
+            ents = []
+        n = len(ents)
+        stale = age is not None and 8.0 < age <= 12.0
+        self.fact3r_head.configure(
+            text=(f"fact3r entities (live map)  —  {n}"
+                  + ("  [stale]" if stale else "")
+                  + ("  (server closed — map erased)" if gone else "")
+                  + ("  (no map yet)" if fact3r is None else "")))
+        self.fact3r_list.delete(0, "end")
+        if not ents:
+            self.fact3r_list.insert(
+                "end", "  (server closed — map erased)" if gone
+                else "  (nothing mapped yet — drive to populate)")
+            return
+        self.fact3r_list.insert("end", f"   {'id':8} {'x':>6} {'y':>6} {'obs':>4} {'d(m)':>5}")
+        for e in ents:
+            xy = e.get("xy") or [0.0, 0.0]
+            is_recalled = e.get("id") == recalled
+            mark = "★ " if is_recalled else "  "
+            d = e.get("depth_m")
+            self.fact3r_list.insert(
+                "end",
+                f"{mark}{str(e.get('id', '?')):8} {xy[0]:6.2f} {xy[1]:6.2f} "
+                f"{e.get('obs', 0):4d} {('%.1f' % d) if d is not None else '-':>5}")
+            if is_recalled:
+                self.fact3r_list.itemconfig(self.fact3r_list.size() - 1, foreground="#7fdfff")
+
     def refresh(self):
         with self.st.lock:
             rgb = self.st.rgb
@@ -756,6 +914,10 @@ class MultilegViewer:
             rec_age = time.time() - self.st.record_status_t if self.st.record_status_t else None
             occ_png = self.st.occupancy_png
             occ_age = time.time() - self.st.occupancy_t if self.st.occupancy_t else None
+            fact3r = self.st.fact3r
+            fact3r_age = time.time() - self.st.fact3r_t if self.st.fact3r_t else None
+
+        self._refresh_fact3r_panel(fact3r, fact3r_age)
 
         detector = status.get("detector") if status else None
         self._draw_camera(rgb, detector)
@@ -807,12 +969,27 @@ class MultilegViewer:
 
 
 def main():
+    global RUNNER_PATH, GOAL_MEMORY_PATH
     ap = argparse.ArgumentParser(description="Live viewer + launcher for run_rover_multileg.py")
     ap.add_argument("--pi-ip", type=str, default=None, help="Pi IP for the Zenoh peer; omit for multicast")
     ap.add_argument("--default-instruction", type=str, default="",
                     help="pre-fill the instruction box with this text (still requires clicking "
                          "Launch -- never auto-launches)")
+    ap.add_argument("--runner", type=str, default=None,
+                    help="path to the --serve runner the Run button spawns (default: "
+                         "run_rover_multileg.py). Point at run_rover_occluded_recall.py for the "
+                         "go-behind + recall pipeline -- it accepts the same --serve / --supervisor-* "
+                         "/ --goal-memory-* / --max-angular args, plus directional + recall clauses.")
+    ap.add_argument("--supervisor-model", type=str, default="Qwen/Qwen3-VL-2B-Instruct",
+                    help="pre-select the Supervisor combobox (still switchable in the GUI). "
+                         "run_rover_memfirst_dino.py's fact3r recall verifies crops with this "
+                         "model -- 7B/8B are far better judges than the 2B default.")
     args = ap.parse_args()
+
+    if args.runner:
+        RUNNER_PATH = os.path.abspath(args.runner)
+        GOAL_MEMORY_PATH = os.path.join(os.path.dirname(RUNNER_PATH), "logs", "live_goal_memory.jsonl")
+        print(f"[INFO] Run button will spawn: {RUNNER_PATH}")
 
     cfg = zenoh.Config()
     if args.pi_ip:
@@ -825,7 +1002,8 @@ def main():
     st = SharedState()
     root = tk.Tk()
     root._subs = zenoh_setup(session, st)   # keep subscriber refs alive for root's lifetime
-    MultilegViewer(root, st, args.pi_ip, session, default_instruction=args.default_instruction)
+    MultilegViewer(root, st, args.pi_ip, session, default_instruction=args.default_instruction,
+                   supervisor_model=args.supervisor_model)
     try:
         root.mainloop()
     finally:

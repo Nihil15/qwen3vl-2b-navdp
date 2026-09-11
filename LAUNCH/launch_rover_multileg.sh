@@ -49,7 +49,12 @@ fi
 set -u
 export HF_HOME=${HF_HOME:-/home/gpu/.cache/huggingface}
 export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-/home/gpu/.cache/huggingface/hub}
-export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+# NOT forced to 1 by default -- live-hit 2026-09-09 (see
+# launch_rover_multileg_gui.sh's identical comment): a stale huggingface_hub
+# negative-cache marker made ClipVerifier's from_pretrained fail outright
+# under offline mode even though the actual file is present locally. Only
+# export it if the caller already had it set in their own environment.
+[[ -n "${HF_HUB_OFFLINE:-}" ]] && export HF_HUB_OFFLINE
 
 pkill -f "run_rover_multileg.py" 2>/dev/null && sleep 1
 pkill -f "nav_pipeline.instruction_gui" 2>/dev/null && sleep 1
